@@ -325,7 +325,7 @@ test('newly discovered CLI session files mirror existing first turn after topic 
   ]);
 });
 
-test('agent message deltas stream into Telegram edits', async () => {
+test('agent message deltas send nothing until the message completes', async () => {
   const state = memoryState();
   await state.bindChat(-100);
   await state.mapThread('old', 44, 'Old');
@@ -342,8 +342,8 @@ test('agent message deltas stream into Telegram edits', async () => {
     });
   }
   await tick();
-  assert.equal(telegram.sent.length, 1);
-  assert.equal(telegram.sent[0].text, 'agentMessage\nCodex\nHi');
+  assert.equal(telegram.sent.length, 0);
+  assert.equal(telegram.edited.length, 0);
 
   codex.emit('event', {
     method: 'item/completed',
@@ -354,10 +354,11 @@ test('agent message deltas stream into Telegram edits', async () => {
   await bridge.stop();
 
   assert.equal(telegram.sent.length, 1);
-  assert.equal(telegram.edited.at(-1).text, 'agentMessage\nCodex\nHi. What do you want?');
+  assert.equal(telegram.sent[0].text, 'agentMessage\nCodex\nHi. What do you want?');
+  assert.equal(telegram.edited.length, 0);
 });
 
-test('completion waits for an in-flight Telegram send and edits that message', async () => {
+test('duplicate completion during a slow send does not send or edit again', async () => {
   const state = memoryState();
   await state.bindChat(-100);
   await state.mapThread('t1', 44, 'One');
@@ -386,12 +387,16 @@ test('completion waits for an in-flight Telegram send and edits that message', a
     await tick();
     assert.equal(telegram.sent.length, 1);
     assert.equal(telegram.edited.length, 0);
+    codex.emit('event', {
+      method: 'item/completed', threadId: 't1',
+      raw: { params: { item: { id: 'a1', type: 'agentMessage', text: 'Final answer' } } },
+    });
+    await tick();
     release();
     await tick();
     assert.equal(telegram.sent.length, 1);
-    assert.equal(telegram.edited.length, 1);
-    assert.equal(telegram.edited[0].messageId, 1);
-    assert.equal(telegram.edited[0].text, 'agentMessage\nCodex\nFinal answer');
+    assert.equal(telegram.edited.length, 0);
+    assert.equal(telegram.sent[0].text, 'agentMessage\nCodex\nFinal answer');
   } finally {
     release();
     await bridge.stop();

@@ -9,8 +9,6 @@ import { approvalLabels, extractUserMessageText, renderApprovalPrompt, renderCod
 
 const TELEGRAM_ECHO_SUPPRESSION_MS = 2 * 60 * 1000;
 const MIRROR_DEDUPE_MS = 5 * 60 * 1000;
-const TELEGRAM_STREAM_EDIT_INTERVAL_MS = 900;
-const TELEGRAM_STREAM_TEXT_LIMIT = 3900;
 const PM2_LOG_LINES = 40;
 const PM2_LOG_TAIL_BYTES = 64 * 1024;
 const DEBUG_NOTICE_THROTTLE_MS = 60 * 1000;
@@ -55,7 +53,6 @@ export class CodexTelegramTopicBridge {
     this.knownThreadUpdatedAt = new Map();
     this.startedAtMs = Date.now();
     this.agentMessageBuffers = new Map();
-    this.agentMessageStreams = new Map();
     this.telegramEchoSuppressions = new Map();
     this.recentMirroredMessages = new Map();
     this.completionNotices = new Map();
@@ -785,7 +782,7 @@ export class CodexTelegramTopicBridge {
       await this.#sendCompletionNotice(event.threadId, 'app-server turn completed', null, event.turnId ?? event.raw?.params?.turn?.id ?? event.raw?.params?.turnId);
       return;
     }
-    if (await this.#streamAgentMessageDelta(event)) return;
+    if (this.#bufferAgentMessageDelta(event)) return;
     const completedAgentMessage = this.#takeCompletedAgentMessage(event);
     if (completedAgentMessage) {
       const messageThreadId = await this.#ensureTopicForThread(event.threadId);
@@ -793,7 +790,7 @@ export class CodexTelegramTopicBridge {
         if (this.#shouldMirrorAllMessages()) await this.#debugMirrorSkip(event.threadId, 'no Telegram topic is mapped for this Codex thread', event.method);
         return;
       }
-      await this.#finalizeAgentMessageStream(event.threadId, messageThreadId, completedAgentMessage);
+      await this.#sendMirroredMessage(event.threadId, messageThreadId, completedAgentMessage.text);
       return;
     }
     if (!this.#shouldMirrorAllMessages() && !isUserOrAgentMessageEvent(event)) return;
@@ -1063,7 +1060,7 @@ export class CodexTelegramTopicBridge {
     return sections.join('\n\n');
   }
 
-  async #streamAgentMessageDelta(event) {
+  #bufferAgentMessageDelta(event) {
     if (event.method !== 'item/agentMessage/delta') return false;
     const params = event.raw.params ?? {};
     const itemId = params.itemId ?? params.item_id ?? params.item?.id;
@@ -1073,9 +1070,7 @@ export class CodexTelegramTopicBridge {
     const current = this.agentMessageBuffers.get(key) ?? '';
     const next = current + delta;
     this.agentMessageBuffers.set(key, next);
-    const messageThreadId = await this.#ensureTopicForThread(event.threadId);
-    if (!messageThreadId) return true;
-    await this.#updateAgentMessageStream(event.threadId, messageThreadId, key, next, false);
+    // Retain fallback text locally; only item/completed may enqueue a Telegram send.
     return true;
   }
 
@@ -1088,93 +1083,6 @@ export class CodexTelegramTopicBridge {
     this.agentMessageBuffers.delete(itemId);
     const text = (item.text || buffered || '').trim();
     return text ? { itemId, text: withMessageType(item.type, `Codex\n${text}`) } : null;
-  }
-
-  async #updateAgentMessageStream(threadId, messageThreadId, itemId, text, force) {
-    const renderedText = withMessageType('agentMessage', `Codex\n${text.trim()}`);
-    if (!renderedText.trim()) {
-      await this.#debugMirrorSkip(threadId, 'agent stream delta was empty');
-      return;
-    }
-    if (this.#rememberMirroredMessage(threadId, renderedText, { dryRun: true })) {
-      return;
-    }
-    if (renderedText.length > TELEGRAM_STREAM_TEXT_LIMIT) {
-      await this.#debugMirrorSkip(threadId, `agent stream delta exceeded ${TELEGRAM_STREAM_TEXT_LIMIT} characters`);
-      return;
-    }
-
-    const stream = this.agentMessageStreams.get(itemId);
-    if (!stream) {
-      const nextStream = {
-        messageId: null,
-        sentText: renderedText,
-        pendingText: renderedText,
-        lastEditedAt: Date.now(),
-        creating: true,
-      };
-      this.agentMessageStreams.set(itemId, nextStream);
-      nextStream.ready = (async () => {
-        const sent = await this.telegram.sendMessage({
-          chatId: this.state.boundChatId,
-          messageThreadId,
-          text: renderedText,
-        });
-        const firstMessage = Array.isArray(sent) ? sent[0] : sent;
-        nextStream.messageId = firstMessage?.message_id ?? null;
-        nextStream.creating = false;
-        nextStream.lastEditedAt = Date.now();
-        if (nextStream.messageId && nextStream.pendingText !== nextStream.sentText) {
-          await this.telegram.editMessageText({
-            chatId: this.state.boundChatId,
-            messageId: nextStream.messageId,
-            text: nextStream.pendingText,
-          });
-          nextStream.sentText = nextStream.pendingText;
-          nextStream.lastEditedAt = Date.now();
-        }
-      })();
-      await nextStream.ready;
-      return;
-    }
-
-    if (stream.pendingText === renderedText) return;
-    stream.pendingText = renderedText;
-    if (stream.creating || !stream.messageId) return;
-    const now = Date.now();
-    if (!force && now - stream.lastEditedAt < TELEGRAM_STREAM_EDIT_INTERVAL_MS) return;
-    await this.telegram.editMessageText({
-      chatId: this.state.boundChatId,
-      messageId: stream.messageId,
-      text: renderedText,
-    });
-    stream.sentText = renderedText;
-    stream.lastEditedAt = now;
-  }
-
-  async #finalizeAgentMessageStream(threadId, messageThreadId, message) {
-    const stream = this.agentMessageStreams.get(message.itemId);
-    if (this.#rememberMirroredMessage(threadId, message.text)) return;
-    // Completion can arrive while Telegram is still acknowledging the first send.
-    // Keep that message and finish its pending edits before applying the final text.
-    try {
-      await stream?.ready;
-    } finally {
-      this.agentMessageStreams.delete(message.itemId);
-    }
-
-    if (!stream?.messageId) {
-      await this.telegram.sendMessage({ chatId: this.state.boundChatId, messageThreadId, text: message.text });
-      return;
-    }
-    if (stream.sentText !== message.text) {
-      await this.telegram.editMessageText({
-        chatId: this.state.boundChatId,
-        messageThreadId,
-        messageId: stream.messageId,
-        text: message.text,
-      });
-    }
   }
 
   async #sendMirroredMessage(threadId, messageThreadId, text) {
