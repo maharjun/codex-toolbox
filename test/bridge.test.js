@@ -1330,3 +1330,52 @@ function responseToolOutputLine(output) {
     },
   });
 }
+
+test('failed Codex rename leaves the Telegram name unchanged', async () => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'Original');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  codex.renameThread = async () => { throw new Error('rename rejected'); };
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
+  await bridge.start();
+  telegram.emit('update', { message: allowedMessage({ text: '/rename New', chat: { id: -100, type: 'supergroup' }, is_topic_message: true, message_thread_id: 44 }) });
+  await tick();
+  await bridge.stop();
+  assert.equal(state.data.threads.t1.title, 'Original');
+  assert.deepEqual(telegram.edited, []);
+});
+
+test('Codex name events update the Telegram topic', async () => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'Original');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
+  await bridge.start();
+  codex.emit('event', { threadId: 't1', method: 'thread/name/updated', raw: {params:{threadName:'From Codex'}} });
+  await tick();
+  await bridge.stop();
+  assert.equal(state.data.threads.t1.title, 'From Codex');
+});
+
+test('Telegram answers a structured Codex question without starting a new turn', async () => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'Question');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  let answer;
+  codex.answerUserInput = (id, answers) => { answer = {id, answers}; };
+  codex.sendToThread = async () => { throw new Error('must answer the pending request'); };
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111], messageScope: 'conversation' });
+  await bridge.start();
+  codex.emit('serverRequest', { id: 9, method: 'item/tool/requestUserInput', threadId: 't1', params: {questions: [{id:'q', question:'Which?', options:[{label:'First'}, {label:'Second'}]}]} });
+  await tick();
+  telegram.emit('update', {message: allowedMessage({text:'2',chat:{id:-100,type:'supergroup'},is_topic_message:true,message_thread_id:44})});
+  await tick();
+  await bridge.stop();
+  assert.deepEqual(answer, {id:9, answers:{q:{answers:['Second']}}});
+});

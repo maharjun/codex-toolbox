@@ -29,3 +29,10 @@ test('treats already-initialized app-server responses as ready', async () => {
   assert.deepEqual(client.notifications, []);
   assert.deepEqual(ready, { reconnect: false });
 });
+
+test('rename failures propagate so Telegram cannot report a false success', async () => {
+  const client = new EventEmitter();
+  client.request = async () => { throw new Error('rename rejected'); };
+  const server = new CodexAppServer({ client });
+  await assert.rejects(server.renameThread('t1', 'New name'), /rename rejected/);
+});

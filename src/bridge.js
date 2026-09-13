@@ -43,6 +43,7 @@ export class CodexTelegramTopicBridge {
     this.discoveryTimer = null;
     this.subscribedThreads = new Set();
     this.pendingResumeThreads = new Set();
+    this.pendingQuestions = new Map();
     this.topicCreationFailures = new Set();
     this.lastTopicCreationFailure = null;
     this.topicCreationPausedUntilMs = 0;
@@ -76,7 +77,7 @@ export class CodexTelegramTopicBridge {
     });
     this.codex.on('event', (event) => this.#mirrorCodexEvent(event).catch((error) => this.#logError(error)));
     this.codex.on('serverRequest', (request) => this.#mirrorApprovalRequest(request).catch((error) => this.#logError(error)));
-    this.codex.on('disconnect', () => this.logger.warn('Codex app-server disconnected; reconnecting'));
+    this.codex.on('disconnect', () => { this.pendingQuestions.clear(); this.logger.warn('Codex app-server disconnected; reconnecting'); });
     this.codex.on('ready', (info) => {
       if (info?.reconnect) this.discoverThreads().catch((error) => this.#logError(error));
     });
@@ -110,6 +111,7 @@ export class CodexTelegramTopicBridge {
       const wasKnown = this.knownThreadUpdatedAt.has(threadKey);
       const previousUpdatedAt = this.knownThreadUpdatedAt.get(threadKey);
       const hasMappedTopic = Boolean(this.state.getTopicForThread(threadId));
+      if (hasMappedTopic && thread.name) await this.#syncThreadName(threadId, thread.name);
       const isNewlyDiscovered = this.didInitialDiscovery && !wasKnown && createdAtMs >= this.startedAtMs;
       const isOldThreadWithNewActivity = this.didInitialDiscovery && wasKnown && !hasMappedTopic && isAfterStartup(updatedAt, this.startedAtMs) && previousUpdatedAt && updatedAt !== previousUpdatedAt;
 
@@ -433,23 +435,24 @@ export class CodexTelegramTopicBridge {
       await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id, text: 'Usage: /rename <title>' });
       return;
     }
-    const topicId = this.state.getTopicForThread(threadId);
-    await this.telegram.editForumTopic(this.state.boundChatId, topicId, title);
-    await this.state.updateThreadTitle(threadId, title);
-    let codexRenamed = true;
-    if (typeof this.codex.renameThread === 'function') {
-      try {
-        await this.codex.renameThread(threadId, title);
-      } catch (error) {
-        codexRenamed = false;
-        await this.#rememberError(`rename Codex thread ${threadId}: ${error.message}`);
-      }
+    try {
+      await this.codex.renameThread(threadId, title);
+    } catch (error) {
+      await this.#rememberError(`rename Codex thread ${threadId}: ${error.message}`);
+      await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id,
+        text: 'Codex could not rename this conversation. Its Telegram topic was left unchanged.' });
+      return;
     }
-    await this.telegram.sendMessage({
-      chatId: message.chat.id,
-      messageThreadId: message.message_thread_id,
-      text: codexRenamed ? `Renamed this topic to "${title}".` : `Renamed this Telegram topic to "${title}", but Codex thread rename failed.`,
-    });
+    await this.#syncThreadName(threadId, title);
+    await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id,
+      text: `Renamed the Codex conversation to "${title}".` });
+  }
+
+  async #syncThreadName(threadId, name) {
+    const mapped = this.state.data.threads[String(threadId)];
+    if (!mapped || !name || mapped.title === name) return;
+    await this.telegram.editForumTopic(this.state.boundChatId, mapped.messageThreadId, name);
+    await this.state.updateThreadTitle(threadId, name);
   }
 
   async #logs(message) {
@@ -485,6 +488,21 @@ export class CodexTelegramTopicBridge {
       return;
     }
     try {
+      const pending = this.pendingQuestions.get(String(threadId));
+      if (pending) {
+        const question = pending.request.params.questions[pending.index];
+        const selected = /^\d+$/.test(message.text.trim()) ? question.options?.[Number(message.text.trim()) - 1]?.label : null;
+        pending.answers[question.id] = { answers: [selected ?? message.text] };
+        pending.index += 1;
+        if (pending.index < pending.request.params.questions.length) {
+          await this.#sendPendingQuestion(threadId, pending);
+        } else {
+          this.pendingQuestions.delete(String(threadId));
+          this.codex.answerUserInput(pending.request.id, pending.answers);
+          await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id, text: 'Answer sent to Codex.' });
+        }
+        return;
+      }
       this.#rememberTelegramEchoSuppression(threadId, message.text);
       await this.codex.sendToThread(threadId, message.text);
     } catch (error) {
@@ -739,6 +757,17 @@ export class CodexTelegramTopicBridge {
 
   async #mirrorCodexEvent(event) {
     if (!this.state.boundChatId || !event.threadId) return;
+    if (event.method === 'serverRequest/resolved') {
+      const pending = this.pendingQuestions.get(String(event.threadId));
+      if (pending && pending.request.id === event.raw?.params?.requestId) {
+        this.pendingQuestions.delete(String(event.threadId));
+      }
+      return;
+    }
+    if (event.method === 'thread/name/updated') {
+      await this.#syncThreadName(event.threadId, event.raw?.params?.threadName);
+      return;
+    }
     if (this.#shouldMirrorNoMessages()) return;
     if (this.#consumeTelegramEchoSuppression(event)) {
       return;
@@ -778,8 +807,27 @@ export class CodexTelegramTopicBridge {
     await this.#sendMirroredMessage(event.threadId, messageThreadId, text);
   }
 
+  async #sendPendingQuestion(threadId, pending) {
+    const question = pending.request.params.questions[pending.index];
+    const text = [`Input needed (${pending.index + 1}/${pending.request.params.questions.length})`, question.question,
+      ...(question.options ?? []).map((option, i) => `${i + 1}. ${option.label}${option.description ? ': ' + option.description : ''}`),
+      '', 'Reply in this topic with your answer or an option number.'].join('\n');
+    await this.telegram.sendMessage({chatId: this.state.boundChatId, messageThreadId: this.state.getTopicForThread(threadId), text, priority: 'high'});
+  }
+
   async #mirrorApprovalRequest(request) {
-    if (!this.#shouldMirrorAllMessages()) return;
+    if (request.method === 'item/tool/requestUserInput') {
+      if (!this.state.boundChatId || !request.threadId || !request.params.questions?.length) return;
+      await this.#ensureTopicForThread(request.threadId);
+      if (request.params.questions.some(question => question.isSecret)) {
+        await this.telegram.sendMessage({chatId: this.state.boundChatId, messageThreadId: this.state.getTopicForThread(request.threadId), text: 'Codex needs confidential input. Please answer in your terminal.'});
+        return;
+      }
+      const pending = {request, index: 0, answers: {}};
+      this.pendingQuestions.set(String(request.threadId), pending);
+      await this.#sendPendingQuestion(request.threadId, pending);
+      return;
+    }
     if (!this.state.boundChatId) return;
     const messageThreadId = request.threadId ? this.state.getTopicForThread(request.threadId) : null;
     if (!messageThreadId) return;
@@ -862,7 +910,7 @@ export class CodexTelegramTopicBridge {
   }
 
   #threadIdForMessage(message) {
-    if (!message.message_thread_id) return null;
+    if (String(message.chat?.id) !== String(this.state.boundChatId) || !message.message_thread_id) return null;
     return this.state.getThreadForTopic(message.message_thread_id);
   }
 
@@ -889,7 +937,7 @@ export class CodexTelegramTopicBridge {
     if (existingTopicId) return existingTopicId;
     if (Date.now() < this.topicCreationPausedUntilMs) return null;
 
-    const title = thread?.title ?? thread?.name ?? `Codex ${String(threadId).slice(0, 8)}`;
+    const title = thread?.name ?? thread?.title ?? `Codex ${String(threadId).slice(0, 8)}`;
     try {
       const topicId = await this.telegram.createForumTopic(this.state.boundChatId, title);
       this.topicCreationFailures.delete(String(threadId));

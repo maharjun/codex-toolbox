@@ -89,7 +89,7 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async renameThread(threadId, title) {
-    return this.#optionalRequest('thread/name/set', { threadId, name: title });
+    return this.client.request('thread/name/set', { threadId, name: title });
   }
 
   async sendToThread(threadId, text) {
@@ -108,6 +108,10 @@ export class CodexAppServer extends EventEmitter {
 
   async interrupt(threadId) {
     return this.client.request('turn/interrupt', { threadId });
+  }
+
+  answerUserInput(id, answers) {
+    this.client.respond(id, { answers });
   }
 
   answerServerRequest(id, decision, data = {}) {
