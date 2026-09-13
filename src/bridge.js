@@ -4,7 +4,6 @@ import { open, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { chunkTelegramText } from './chunking.js';
 import { approvalKeyboard, getCommand, isForumMessage } from './telegram.js';
 import { approvalLabels, extractUserMessageText, renderApprovalPrompt, renderCodexEvent } from './mirror-policy.js';
 
@@ -1121,16 +1120,13 @@ export class CodexTelegramTopicBridge {
       await this.telegram.sendMessage({ chatId: this.state.boundChatId, messageThreadId, text: message.text });
       return;
     }
-    const [firstChunk, ...remainingChunks] = chunkTelegramText(message.text);
-    if (stream.sentText !== firstChunk) {
+    if (stream.sentText !== message.text) {
       await this.telegram.editMessageText({
         chatId: this.state.boundChatId,
+        messageThreadId,
         messageId: stream.messageId,
-        text: firstChunk,
+        text: message.text,
       });
-    }
-    for (const chunk of remainingChunks) {
-      await this.telegram.sendMessage({ chatId: this.state.boundChatId, messageThreadId, text: chunk });
     }
   }
 

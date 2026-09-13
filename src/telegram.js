@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import https from 'node:https';
-import { chunkTelegramText } from './chunking.js';
+import { renderTelegramMarkdown } from './telegram-markdown.js';
 
 export class TelegramClient extends EventEmitter {
   constructor({
@@ -97,33 +97,53 @@ export class TelegramClient extends EventEmitter {
 
   async sendMessage({ chatId, messageThreadId = null, text, replyMarkup = null, priority = 'normal' }) {
     const results = [];
-    for (const chunk of chunkTelegramText(text)) {
-      results.push(await this.sendMessageChunk({ chatId, messageThreadId, text: chunk, replyMarkup, priority }));
+    for (const rendered of renderTelegramMarkdown(text)) {
+      results.push(await this.sendMessageChunk({ chatId, messageThreadId, rendered, replyMarkup, priority }));
       replyMarkup = null;
     }
     return results;
   }
 
-  async sendMessageChunk({ chatId, messageThreadId = null, text, replyMarkup = null, priority = 'normal' }) {
+  async sendMessageChunk({ chatId, messageThreadId = null, text, rendered = null, replyMarkup = null, priority = 'normal' }) {
+    rendered ??= renderTelegramMarkdown(text)[0] ?? {text: ' ', html: ' '};
     const payload = {
       chat_id: chatId,
-      text,
+      text: rendered.html,
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
     };
     if (messageThreadId != null) payload.message_thread_id = Number(messageThreadId);
     if (replyMarkup) payload.reply_markup = replyMarkup;
-    return this.queuedApi('sendMessage', payload, { chatId, priority });
+    return this.sendFormatted('sendMessage', payload, rendered.text, { chatId, priority });
   }
 
-  async editMessageText({ chatId, messageId, text, replyMarkup = null, priority = 'normal' }) {
+  async editMessageText({ chatId, messageId, messageThreadId = null, text, replyMarkup = null, priority = 'normal' }) {
+    const [first, ...rest] = renderTelegramMarkdown(text);
+    if (!first) return true;
     const payload = {
       chat_id: chatId,
       message_id: Number(messageId),
-      text,
+      text: first.html,
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
     };
     if (replyMarkup) payload.reply_markup = replyMarkup;
-    return this.queuedApi('editMessageText', payload, { chatId, priority });
+    const result = await this.sendFormatted('editMessageText', payload, first.text, { chatId, priority });
+    for (const rendered of rest) {
+      await this.sendMessageChunk({ chatId, messageThreadId, rendered, priority });
+    }
+    return result;
+  }
+
+  async sendFormatted(method, payload, plainText, options) {
+    try {
+      return await this.queuedApi(method, payload, options);
+    } catch (error) {
+      if (error.response?.error_code !== 400 || !/parse entities|unsupported start tag|can't find end tag/i.test(error.message)) throw error;
+      const fallback = { ...payload, text: plainText };
+      delete fallback.parse_mode;
+      return this.queuedApi(method, fallback, options);
+    }
   }
 
   async answerCallbackQuery(callbackQueryId, text = null) {
