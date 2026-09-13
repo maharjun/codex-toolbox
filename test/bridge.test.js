@@ -185,7 +185,7 @@ test('session file tailing mirrors response_item tool records', async () => {
   ]);
 });
 
-test('Telegram messageScope=conversation mirrors only user and agent session records', async () => {
+test('Telegram conversation scope mirrors messages silently and alerts on completion', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-toolbox-conversation-scope-'));
   const file = join(dir, 'session.jsonl');
   await writeFile(file, '', 'utf8');
@@ -201,7 +201,10 @@ test('Telegram messageScope=conversation mirrors only user and agent session rec
   await bridge.discoverThreads();
   await bridge.stop();
 
-  assert.deepEqual(telegram.sent.map((message) => message.text), ['user_message\nUser\nfrom user', 'agent_message\nCodex\nfrom assistant']);
+  assert.deepEqual(telegram.sent.slice(0, 2).map((message) => message.text), ['user_message\nUser\nfrom user', 'agent_message\nCodex\nfrom assistant']);
+  assert.ok(telegram.sent.slice(0, 2).every(message => !message.notify));
+  assert.equal(telegram.sent.length, 3);
+  assert.equal(telegram.sent[2].notify, true);
 });
 
 test('Telegram messageScope=none disables mirrored Codex transcript messages', async () => {
@@ -1378,4 +1381,60 @@ test('Telegram answers a structured Codex question without starting a new turn',
   await tick();
   await bridge.stop();
   assert.deepEqual(answer, {id:9, answers:{q:{answers:['Second']}}});
+  assert.equal(telegram.sent.find(message => message.text.startsWith('Input needed')).notify, true);
+  assert.ok(!telegram.sent.find(message => message.text === 'Answer sent to Codex.').notify);
+});
+
+
+test('streaming is silent and completion alerts deduplicate across live events and session tail per turn', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-notifications-'));
+  const file = join(dir, 'session.jsonl');
+  await writeFile(file, '', 'utf8');
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'One');
+  await state.mapThread('t2', 45, 'Two');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex({threads: [{id:'t1',title:'One',source:'vscode',path:file,updatedAt:'1'}]});
+  const bridge = new CodexTelegramTopicBridge({codex, telegram, state, allowedUserIds:[111111111], messageScope:'conversation'});
+  await bridge.start();
+  codex.emit('event', {method:'item/agentMessage/delta',threadId:'t1',raw:{params:{itemId:'a1',delta:'Working'}}});
+  await tick();
+  codex.emit('event', {method:'item/completed',threadId:'t1',raw:{params:{item:{id:'a1',type:'agentMessage',text:'Working'}}}});
+  await tick();
+  assert.ok(telegram.sent.length > 0);
+  assert.ok(telegram.sent.every(message => !message.notify));
+  codex.emit('event', {method:'turn/completed',threadId:'t1',turnId:'turn1',raw:{params:{}}});
+  await tick();
+  await appendFile(file, sessionLine('task_complete', {turn_id:'turn1'})+'\n');
+  await bridge.discoverThreads();
+  assert.equal(telegram.sent.filter(message => message.notify).length, 1);
+  // Distinct turns and different agents must still alert, even immediately.
+  codex.emit('event', {method:'turn/completed',threadId:'t1',turnId:'turn2',raw:{params:{}}});
+  codex.emit('event', {method:'turn/completed',threadId:'t2',turnId:'turn1',raw:{params:{}}});
+  await tick();
+  assert.equal(telegram.sent.filter(message => message.notify).length, 3);
+  await appendFile(file, sessionLine('task_complete', {turn_id:'turn3'})+'\n');
+  await bridge.discoverThreads();
+  codex.emit('event', {method:'turn/completed',threadId:'t1',turnId:'turn3',raw:{params:{}}});
+  await tick();
+  assert.equal(telegram.sent.filter(message => message.notify).length, 4);
+  await bridge.stop();
+});
+
+test('approval and confidential-input requests alert in conversation scope', async () => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'One');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const bridge = new CodexTelegramTopicBridge({codex, telegram, state, allowedUserIds:[111111111], messageScope:'conversation'});
+  await bridge.start();
+  codex.emit('serverRequest', {id:10,method:'item/commandExecution/requestApproval',threadId:'t1',params:{command:'example'}});
+  await tick();
+  codex.emit('serverRequest', {id:11,method:'item/tool/requestUserInput',threadId:'t1',params:{questions:[{id:'secret',question:'Secret?',isSecret:true}]}});
+  await tick();
+  assert.equal(telegram.sent.length, 2);
+  assert.ok(telegram.sent.every(message => message.notify === true));
+  await bridge.stop();
 });

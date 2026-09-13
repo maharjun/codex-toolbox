@@ -95,20 +95,22 @@ export class TelegramClient extends EventEmitter {
     }, { chatId });
   }
 
-  async sendMessage({ chatId, messageThreadId = null, text, replyMarkup = null, priority = 'normal' }) {
+  async sendMessage({ chatId, messageThreadId = null, text, replyMarkup = null, priority = 'normal', notify = false }) {
     const results = [];
     for (const rendered of renderTelegramMarkdown(text)) {
-      results.push(await this.sendMessageChunk({ chatId, messageThreadId, rendered, replyMarkup, priority }));
+      results.push(await this.sendMessageChunk({ chatId, messageThreadId, rendered, replyMarkup, priority, notify }));
       replyMarkup = null;
+      notify = false;
     }
     return results;
   }
 
-  async sendMessageChunk({ chatId, messageThreadId = null, text, rendered = null, replyMarkup = null, priority = 'normal' }) {
+  async sendMessageChunk({ chatId, messageThreadId = null, text, rendered = null, replyMarkup = null, priority = 'normal', notify = false }) {
     rendered ??= renderTelegramMarkdown(text)[0] ?? {text: ' ', html: ' '};
     const payload = {
       chat_id: chatId,
       text: rendered.html,
+      disable_notification: !notify,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     };

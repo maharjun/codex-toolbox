@@ -54,6 +54,7 @@ export class CodexTelegramTopicBridge {
     this.agentMessageStreams = new Map();
     this.telegramEchoSuppressions = new Map();
     this.recentMirroredMessages = new Map();
+    this.completionNotices = new Map();
     this.lastDiscoveryStats = { seen: 0, created: 0, resumed: 0, skipped: 0 };
     this.sessionFilePaths = new Map();
     this.sessionFileOffsets = new Map();
@@ -776,7 +777,7 @@ export class CodexTelegramTopicBridge {
       return;
     }
     if (isCompletionEvent(event)) {
-      if (this.#shouldMirrorAllMessages()) await this.#sendCompletionNotice(event.threadId, 'app-server turn completed');
+      await this.#sendCompletionNotice(event.threadId, 'app-server turn completed', null, event.turnId ?? event.raw?.params?.turn?.id ?? event.raw?.params?.turnId);
       return;
     }
     if (await this.#streamAgentMessageDelta(event)) return;
@@ -811,7 +812,7 @@ export class CodexTelegramTopicBridge {
     const text = [`Input needed (${pending.index + 1}/${pending.request.params.questions.length})`, question.question,
       ...(question.options ?? []).map((option, i) => `${i + 1}. ${option.label}${option.description ? ': ' + option.description : ''}`),
       '', 'Reply in this topic with your answer or an option number.'].join('\n');
-    await this.telegram.sendMessage({chatId: this.state.boundChatId, messageThreadId: this.state.getTopicForThread(threadId), text, priority: 'high'});
+    await this.telegram.sendMessage({chatId: this.state.boundChatId, messageThreadId: this.state.getTopicForThread(threadId), text, priority: 'high', notify: true});
   }
 
   async #mirrorApprovalRequest(request) {
@@ -819,7 +820,7 @@ export class CodexTelegramTopicBridge {
       if (!this.state.boundChatId || !request.threadId || !request.params.questions?.length) return;
       await this.#ensureTopicForThread(request.threadId);
       if (request.params.questions.some(question => question.isSecret)) {
-        await this.telegram.sendMessage({chatId: this.state.boundChatId, messageThreadId: this.state.getTopicForThread(request.threadId), text: 'Codex needs confidential input. Please answer in your terminal.'});
+        await this.telegram.sendMessage({chatId: this.state.boundChatId, messageThreadId: this.state.getTopicForThread(request.threadId), text: 'Codex needs confidential input. Please answer in your terminal.', priority: 'high', notify: true});
         return;
       }
       const pending = {request, index: 0, answers: {}};
@@ -837,6 +838,8 @@ export class CodexTelegramTopicBridge {
       messageThreadId,
       text: renderApprovalPrompt(request, { includeMessageType: true }),
       replyMarkup: approvalKeyboard(callbackId, approvalLabels(request)),
+      priority: 'high',
+      notify: true,
     });
   }
 
@@ -892,7 +895,7 @@ export class CodexTelegramTopicBridge {
         return;
       }
       if (rendered.priority === 'high') {
-        await this.telegram.sendMessage({ chatId: this.state.boundChatId, messageThreadId, text, priority: 'high' });
+        await this.#sendCompletionNotice(threadId, 'session turn completed', rendered.detail, rendered.turnId);
       } else {
         await this.#sendMirroredMessage(threadId, messageThreadId, text);
       }
@@ -1152,19 +1155,36 @@ export class CodexTelegramTopicBridge {
     });
   }
 
-  async #sendCompletionNotice(threadId, reason, detail = null) {
+  async #sendCompletionNotice(threadId, reason, detail = null, turnId = null) {
     const messageThreadId = this.state.getTopicForThread(threadId);
     if (!this.state.boundChatId || !messageThreadId) return;
-    const pending = typeof this.telegram.pendingOutboundCount === 'function'
-      ? this.telegram.pendingOutboundCount()
-      : 0;
-    const backlog = pending > 0 ? `\nTelegram backlog still sending: ${pending} queued item${pending === 1 ? '' : 's'}.` : '';
-    await this.telegram.sendMessage({
-      chatId: this.state.boundChatId,
-      messageThreadId,
-      text: withMessageType('task_complete', `Status: Codex task complete.${detail ? `\n${detail}` : ''}${backlog}\nReason: ${reason}`),
-      priority: 'high',
-    });
+    // Both app-server events and the session tail can report the same turn.
+    const now = Date.now();
+    const recent = (this.completionNotices.get(String(threadId)) ?? [])
+      .filter(entry => now - entry.at < MIRROR_DEDUPE_MS);
+    const duplicate = recent.some(entry => turnId && entry.turnId
+      ? String(turnId) === String(entry.turnId)
+      : now - entry.at < 10000);
+    if (duplicate) return;
+    const notice = {turnId, at: now};
+    recent.push(notice);
+    this.completionNotices.set(String(threadId), recent);
+    try {
+      const pending = typeof this.telegram.pendingOutboundCount === 'function'
+        ? this.telegram.pendingOutboundCount()
+        : 0;
+      const backlog = pending > 0 ? `\nTelegram backlog still sending: ${pending} queued item${pending === 1 ? '' : 's'}.` : '';
+      await this.telegram.sendMessage({
+        chatId: this.state.boundChatId,
+        messageThreadId,
+        text: withMessageType('task_complete', `Status: Codex task complete.${detail ? `\n${detail}` : ''}${backlog}\nReason: ${reason}`),
+        priority: 'high',
+        notify: true,
+      });
+    } catch (error) {
+      this.completionNotices.set(String(threadId), recent.filter(entry => entry !== notice));
+      throw error;
+    }
   }
 
   #rememberMirroredMessage(threadId, text, options = {}) {
@@ -1589,6 +1609,11 @@ function renderSessionLogLine(line, messageScope = 'all') {
       ? { text: withMessageType(payload.type, `Codex\n${payload.message}`) }
       : { text: null, debugReason: 'session agent_message had no message text' };
   }
+  if (payload.type === 'task_complete') {
+    const duration = formatDuration(payload.duration_ms);
+    const detail = duration ? `\nDuration: ${duration}` : '';
+    return { text: withMessageType(payload.type, `Status: Codex task complete.${detail}`), priority: 'high', detail: detail.trim() || null, turnId: payload.turn_id ?? payload.turnId ?? null };
+  }
   if (messageScope !== 'all') return { text: null };
   if (payload.type === 'plan_update' && payload.explanation) return { text: withMessageType(payload.type, `Plan\n${payload.explanation}`) };
   if (payload.type === 'stream_error' || payload.type === 'error') return { text: withMessageType(payload.type, `Error\n${payload.message ?? payload.error ?? 'Unknown error'}`) };
@@ -1603,11 +1628,6 @@ function renderSessionLogLine(line, messageScope = 'all') {
   }
   if (payload.type === 'patch_apply_end') {
     return { text: withMessageType(payload.type, ['Tool output: apply_patch', formatToolOutput(payload)].filter(Boolean).join('\n')) };
-  }
-  if (payload.type === 'task_complete') {
-    const duration = formatDuration(payload.duration_ms);
-    const detail = duration ? `\nDuration: ${duration}` : '';
-    return { text: withMessageType(payload.type, `Status: Codex task complete.${detail}`), priority: 'high' };
   }
   return { text: null };
 }

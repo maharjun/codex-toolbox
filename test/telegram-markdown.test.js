@@ -64,6 +64,7 @@ test('final stream edits retain formatting across overflow messages in the same 
  assert.match(calls[0].url,/editMessageText$/);
  assert.match(calls[1].url,/sendMessage$/);
  assert.equal(calls[1].body.message_thread_id,22);
+ assert.equal(calls[1].body.disable_notification,true);
  assert.ok(calls.every(c=>c.body.parse_mode==='HTML' && /^<b>x+<\/b>$/.test(c.body.text)));
 });
 
@@ -79,4 +80,21 @@ test('non-formatting errors propagate without retrying delivery', async () => {
  const {client,calls}=mockClient(()=>({ok:false,json:async()=>({ok:false,error_code:403,description:'Forbidden'})}));
  await assert.rejects(client.sendMessage({chatId:-1,text:'**bold**'}),/Forbidden/);
  assert.equal(calls.length,1);
+});
+
+
+test('messages default to silent, explicit alerts notify only on the first Markdown chunk', async () => {
+ const {client,calls}=mockClient();
+ await client.sendMessage({chatId:-1,text:'**Progress**'});
+ assert.equal(calls[0].body.disable_notification,true);
+ await client.sendMessage({chatId:-1,text:'**'+'x'.repeat(4100)+'**',notify:true});
+ assert.equal(calls[1].body.disable_notification,false);
+ assert.equal(calls[2].body.disable_notification,true);
+});
+
+test('formatting fallback preserves the notification setting', async () => {
+ const {client,calls}=mockClient(n=>n===1?{ok:false,json:async()=>({ok:false,error_code:400,description:"Bad Request: can't parse entities"})}:null);
+ await client.sendMessage({chatId:-1,text:'**Input needed**',notify:true});
+ assert.equal(calls.length,2);
+ assert.ok(calls.every(call=>call.body.disable_notification===false));
 });
