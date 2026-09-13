@@ -49,6 +49,7 @@ export async function createBridge(options) {
     pollMs: options.pollMs,
     allowedUserIds: options.allowedUserIds,
     messageScope: options.telegramMessageScope,
+    mirrorUserMessages: options.mirrorUserMessages,
   });
 }
 
@@ -86,6 +87,7 @@ export function createBridgeFromEnv(env) {
         cwd: env.CODEX_APP_SERVER_CWD || process.cwd(),
         telegramToken: env.TELEGRAM_BOT_TOKEN,
         traceDelivery: env.CODEX_TELEGRAM_TRACE_DELIVERY === '1',
+        mirrorUserMessages: env.CODEX_TELEGRAM_MIRROR_USER_MESSAGES === '1',
         discordToken: env.DISCORD_BOT_TOKEN,
         allowedDiscordUserIds,
         discordGuildId: env.DISCORD_GUILD_ID,

@@ -31,12 +31,13 @@ const TELEGRAM_COMMANDS = [
 ];
 
 export class CodexTelegramTopicBridge {
-  constructor({ codex, telegram, state, pollMs = 5000, logger = console, allowedUserIds = [], messageScope = 'all' }) {
+  constructor({ codex, telegram, state, pollMs = 5000, logger = console, allowedUserIds = [], messageScope = 'all', mirrorUserMessages = true }) {
     this.codex = codex;
     this.telegram = telegram;
     this.state = state;
     this.pollMs = pollMs;
     this.logger = logger;
+    this.mirrorUserMessages = mirrorUserMessages;
     this.allowedUserIds = new Set(allowedUserIds.map((id) => String(id)));
     this.messageScope = normalizeMessageScope(messageScope);
     this.discoveryTimer = null;
@@ -770,6 +771,7 @@ export class CodexTelegramTopicBridge {
       return;
     }
     if (this.#shouldMirrorNoMessages()) return;
+    if (!this.mirrorUserMessages && extractUserMessageText(event)) return;
     if (this.#consumeTelegramEchoSuppression(event)) {
       return;
     }
@@ -887,7 +889,7 @@ export class CodexTelegramTopicBridge {
       }
       const text = rendered.text;
       const mirroredUserText = mirroredRoleText(text, 'User');
-      if (mirroredUserText && this.#consumeTextEchoSuppression(threadId, mirroredUserText)) {
+      if (mirroredUserText && (!this.mirrorUserMessages || this.#consumeTextEchoSuppression(threadId, mirroredUserText))) {
         continue;
       }
       const messageThreadId = this.state.getTopicForThread(threadId);

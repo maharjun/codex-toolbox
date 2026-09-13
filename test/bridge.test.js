@@ -1438,3 +1438,37 @@ test('approval and confidential-input requests alert in conversation scope', asy
   assert.ok(telegram.sent.every(message => message.notify === true));
   await bridge.stop();
 });
+
+test('disabled user mirroring filters live and session users but preserves agent output, alerts, and replies', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-agent-only-'));
+  const file = join(dir, 'session.jsonl');
+  await writeFile(file, '');
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'One');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex({threads:[{id:'t1',path:file,updatedAt:'1'}]});
+  const bridge = new CodexTelegramTopicBridge({codex,telegram,state,allowedUserIds:[111111111],messageScope:'conversation',mirrorUserMessages:false});
+  await bridge.start();
+  try {
+    codex.emit('event', {method:'item/completed',threadId:'t1',raw:{params:{item:{id:'u1',type:'userMessage',content:[{type:'text',text:'live user'}]}}}});
+    codex.emit('event', {method:'message/completed',threadId:'t1',raw:{params:{role:'user',text:'alternate user'}}});
+    await tick();
+    await appendFile(file, [sessionLine('user_message',{message:'log user'}),responseMessageLine('user','response user'),responseMessageLine('assistant','Agent answer'),sessionLine('task_complete',{turn_id:'done1'})].join('\n')+'\n');
+    await bridge.discoverThreads();
+    assert.equal(telegram.sent.length,2);
+    assert.match(telegram.sent[0].text,/Agent answer/);
+    assert.ok(!telegram.sent[0].notify);
+    assert.equal(telegram.sent[1].notify,true);
+    codex.emit('event', {method:'item/completed',threadId:'t1',raw:{params:{item:{id:'a1',type:'agentMessage',text:'Live agent'}}}});
+    await tick();
+    assert.match(telegram.sent.at(-1).text,/Live agent/);
+    telegram.emit('update', {message:allowedMessage({text:'Continue please',chat:{id:-100,type:'supergroup'},is_topic_message:true,message_thread_id:44})});
+    await tick();
+    assert.deepEqual(codex.sent,[{threadId:'t1',text:'Continue please'}]);
+    codex.emit('serverRequest', {id:99,method:'item/tool/requestUserInput',threadId:'t1',params:{questions:[{id:'q',question:'Which option?'}]}});
+    await tick();
+    assert.match(telegram.sent.at(-1).text,/Input needed/);
+    assert.equal(telegram.sent.at(-1).notify,true);
+  } finally { await bridge.stop(); }
+});
