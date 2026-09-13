@@ -482,14 +482,8 @@ export class CodexTelegramTopicBridge {
       });
       return;
     }
-    if (!threadId) {
-      await this.telegram.sendMessage({
-        chatId: message.chat.id,
-        messageThreadId: message.message_thread_id,
-        text: 'This Telegram topic is not linked to a Codex thread. Use /new to create a new Codex topic, or wait for a new/active Codex session to create one automatically.',
-      });
-      return;
-    }
+    // Another bridge may own this topic in the shared group.
+    if (!threadId) return;
     try {
       const pending = this.pendingQuestions.get(String(threadId));
       if (pending) {
@@ -1052,7 +1046,7 @@ export class CodexTelegramTopicBridge {
     const itemId = String(item.id);
     const buffered = this.agentMessageBuffers.get(itemId);
     this.agentMessageBuffers.delete(itemId);
-    const text = (buffered || item.text || '').trim();
+    const text = (item.text || buffered || '').trim();
     return text ? { itemId, text: withMessageType(item.type, `Codex\n${text}`) } : null;
   }
 
@@ -1080,24 +1074,27 @@ export class CodexTelegramTopicBridge {
         creating: true,
       };
       this.agentMessageStreams.set(itemId, nextStream);
-      const sent = await this.telegram.sendMessage({
-        chatId: this.state.boundChatId,
-        messageThreadId,
-        text: renderedText,
-      });
-      const firstMessage = Array.isArray(sent) ? sent[0] : sent;
-      nextStream.messageId = firstMessage?.message_id ?? null;
-      nextStream.creating = false;
-      nextStream.lastEditedAt = Date.now();
-      if (nextStream.messageId && nextStream.pendingText !== nextStream.sentText) {
-        await this.telegram.editMessageText({
+      nextStream.ready = (async () => {
+        const sent = await this.telegram.sendMessage({
           chatId: this.state.boundChatId,
-          messageId: nextStream.messageId,
-          text: nextStream.pendingText,
+          messageThreadId,
+          text: renderedText,
         });
-        nextStream.sentText = nextStream.pendingText;
+        const firstMessage = Array.isArray(sent) ? sent[0] : sent;
+        nextStream.messageId = firstMessage?.message_id ?? null;
+        nextStream.creating = false;
         nextStream.lastEditedAt = Date.now();
-      }
+        if (nextStream.messageId && nextStream.pendingText !== nextStream.sentText) {
+          await this.telegram.editMessageText({
+            chatId: this.state.boundChatId,
+            messageId: nextStream.messageId,
+            text: nextStream.pendingText,
+          });
+          nextStream.sentText = nextStream.pendingText;
+          nextStream.lastEditedAt = Date.now();
+        }
+      })();
+      await nextStream.ready;
       return;
     }
 
@@ -1117,8 +1114,14 @@ export class CodexTelegramTopicBridge {
 
   async #finalizeAgentMessageStream(threadId, messageThreadId, message) {
     const stream = this.agentMessageStreams.get(message.itemId);
-    this.agentMessageStreams.delete(message.itemId);
     if (this.#rememberMirroredMessage(threadId, message.text)) return;
+    // Completion can arrive while Telegram is still acknowledging the first send.
+    // Keep that message and finish its pending edits before applying the final text.
+    try {
+      await stream?.ready;
+    } finally {
+      this.agentMessageStreams.delete(message.itemId);
+    }
 
     if (!stream?.messageId) {
       await this.telegram.sendMessage({ chatId: this.state.boundChatId, messageThreadId, text: message.text });

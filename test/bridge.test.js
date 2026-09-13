@@ -357,6 +357,47 @@ test('agent message deltas stream into Telegram edits', async () => {
   assert.equal(telegram.edited.at(-1).text, 'agentMessage\nCodex\nHi. What do you want?');
 });
 
+test('completion waits for an in-flight Telegram send and edits that message', async () => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'One');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const send = telegram.sendMessage;
+  telegram.sendMessage = async message => {
+    const result = await send(message);
+    await pending;
+    return result;
+  };
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state });
+  await bridge.start();
+  try {
+    codex.emit('event', {
+      method: 'item/agentMessage/delta', threadId: 't1',
+      raw: { params: { itemId: 'a1', delta: 'Partial' } },
+    });
+    await tick();
+    codex.emit('event', {
+      method: 'item/completed', threadId: 't1',
+      raw: { params: { item: { id: 'a1', type: 'agentMessage', text: 'Final answer' } } },
+    });
+    await tick();
+    assert.equal(telegram.sent.length, 1);
+    assert.equal(telegram.edited.length, 0);
+    release();
+    await tick();
+    assert.equal(telegram.sent.length, 1);
+    assert.equal(telegram.edited.length, 1);
+    assert.equal(telegram.edited[0].messageId, 1);
+    assert.equal(telegram.edited[0].text, 'agentMessage\nCodex\nFinal answer');
+  } finally {
+    release();
+    await bridge.stop();
+  }
+});
+
 test('thread status changes are not mirrored', async () => {
   const state = memoryState();
   await state.bindChat(-100);
@@ -575,7 +616,7 @@ test('desktop-originated user messages still mirror with a user label', async ()
   assert.equal(telegram.sent[0].text, 'userMessage\nUser\nfrom desktop');
 });
 
-test('topic replies in unmapped topics get a clear error', async () => {
+test('topic replies in unmapped topics are silently ignored', async () => {
   const state = memoryState();
   await state.bindChat(-100);
   const telegram = fakeTelegram();
@@ -595,7 +636,7 @@ test('topic replies in unmapped topics get a clear error', async () => {
   await bridge.stop();
 
   assert.deepEqual(codex.sent, []);
-  assert.match(telegram.sent.at(-1).text, /not linked to a Codex thread/);
+  assert.deepEqual(telegram.sent, []);
 });
 
 test('allowed messages outside forum topics get guidance', async () => {
