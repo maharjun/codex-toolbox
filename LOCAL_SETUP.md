@@ -1,5 +1,7 @@
 # Local Telegram setup
 
+For the shared Windows/POSIX launcher, see [PORTABLE_SETUP.md](PORTABLE_SETUP.md).
+
 Installed from yhdesai/codex-toolbox at 3ede73a, with local compatibility changes:
 
 - Adapt JSONL to the shared Codex daemon's Unix WebSocket transport, disabling compression.

@@ -1,3 +1,4 @@
+import { parseAppServerArgs } from './local-runtime.js';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { BridgeState } from './state.js';
@@ -53,7 +54,7 @@ export async function createBridge(options) {
 export function createBridgeFromEnv(env) {
   const statePath = env.CODEX_TOOLBOX_STATE || env.CODEX_TELEGRAM_STATE || join(homedir(), '.codex-toolbox.json');
   const codexCommand = env.CODEX_APP_SERVER_COMMAND || 'codex';
-  const codexArgs = splitArgs(env.CODEX_APP_SERVER_ARGS || 'app-server proxy');
+  const codexArgs = parseAppServerArgs(env);
   const pollMs = Number(env.CODEX_TELEGRAM_POLL_MS || 5000);
   const telegramPrivateIntervalMs = Number(env.CODEX_TELEGRAM_PRIVATE_INTERVAL_MS || 1000);
   const telegramGroupIntervalMs = Number(env.CODEX_TELEGRAM_GROUP_INTERVAL_MS || 3200);

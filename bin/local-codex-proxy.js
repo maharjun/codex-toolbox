@@ -1,11 +1,14 @@
 #!/usr/bin/env node
-// Adapt Toolbox's JSONL client to the shared Codex daemon's local WebSocket.
+// Adapt Toolbox's JSONL client to a shared Codex WebSocket on Windows or POSIX.
 import { createInterface } from 'node:readline';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { proxyEndpoint } from '../src/local-runtime.js';
 import WebSocket from 'ws';
-const socket = process.env.CODEX_CONTROL_SOCKET || join(process.env.CODEX_HOME || homedir() + '/.codex', 'app-server-control/app-server-control.sock');
-const ws = new WebSocket(`ws+unix://${socket}:/rpc`, { perMessageDeflate: false });
+let endpoint;
+try { endpoint = proxyEndpoint(); } catch { console.error('Invalid Codex endpoint configuration.'); process.exit(1); }
+const ws = new WebSocket(endpoint, {
+  perMessageDeflate: false,
+  ...(process.env.CODEX_APP_SERVER_TOKEN ? { headers: { Authorization: `Bearer ${process.env.CODEX_APP_SERVER_TOKEN}` } } : {}),
+});
 const pending = [];
 const input = createInterface({ input: process.stdin });
 input.on('line', line => {
