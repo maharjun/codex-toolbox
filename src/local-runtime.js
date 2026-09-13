@@ -39,6 +39,7 @@ export function launcherEnv(config, { env = process.env, platform = process.plat
     ...env,
     TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_API_KEY,
     TELEGRAM_ALLOWED_USER_IDS: String(config.userId),
+    TELEGRAM_ALERT_CHAT_ID: String(config.userId),
     CODEX_SYNC_PROVIDER: 'telegram',
     CODEX_TOOLBOX_STATE: localPaths({platform, home, env}).state,
     CODEX_APP_SERVER_COMMAND: execPath,

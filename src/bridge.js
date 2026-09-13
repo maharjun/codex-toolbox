@@ -31,13 +31,14 @@ const TELEGRAM_COMMANDS = [
 ];
 
 export class CodexTelegramTopicBridge {
-  constructor({ codex, telegram, state, pollMs = 5000, logger = console, allowedUserIds = [], messageScope = 'all', mirrorUserMessages = true }) {
+  constructor({ codex, telegram, state, pollMs = 5000, logger = console, allowedUserIds = [], messageScope = 'all', mirrorUserMessages = true, alertChatId = null }) {
     this.codex = codex;
     this.telegram = telegram;
     this.state = state;
     this.pollMs = pollMs;
     this.logger = logger;
     this.mirrorUserMessages = mirrorUserMessages;
+    this.alertChatId = alertChatId;
     this.allowedUserIds = new Set(allowedUserIds.map((id) => String(id)));
     this.messageScope = normalizeMessageScope(messageScope);
     this.discoveryTimer = null;
@@ -815,7 +816,7 @@ export class CodexTelegramTopicBridge {
     const text = [`Input needed (${pending.index + 1}/${pending.request.params.questions.length})`, question.question,
       ...(question.options ?? []).map((option, i) => `${i + 1}. ${option.label}${option.description ? ': ' + option.description : ''}`),
       '', 'Reply in this topic with your answer or an option number.'].join('\n');
-    await this.telegram.sendMessage({chatId: this.state.boundChatId, messageThreadId: this.state.getTopicForThread(threadId), text, priority: 'high', notify: true});
+    await this.#sendAttentionNotice(threadId, text, { copyToTopic: true });
   }
 
   async #mirrorApprovalRequest(request) {
@@ -823,7 +824,7 @@ export class CodexTelegramTopicBridge {
       if (!this.state.boundChatId || !request.threadId || !request.params.questions?.length) return;
       await this.#ensureTopicForThread(request.threadId);
       if (request.params.questions.some(question => question.isSecret)) {
-        await this.telegram.sendMessage({chatId: this.state.boundChatId, messageThreadId: this.state.getTopicForThread(request.threadId), text: 'Codex needs confidential input. Please answer in your terminal.', priority: 'high', notify: true});
+        await this.#sendAttentionNotice(request.threadId, 'Codex needs confidential input. Please answer in your terminal.', { copyToTopic: true });
         return;
       }
       const pending = {request, index: 0, answers: {}};
@@ -836,13 +837,10 @@ export class CodexTelegramTopicBridge {
     if (!messageThreadId) return;
     const callbackId = randomUUID();
     await this.state.rememberApproval(callbackId, { requestId: request.id, threadId: request.threadId });
-    await this.telegram.sendMessage({
-      chatId: this.state.boundChatId,
-      messageThreadId,
-      text: renderApprovalPrompt(request, { includeMessageType: true }),
+    await this.#sendAttentionNotice(request.threadId, renderApprovalPrompt(request, { includeMessageType: true }), {
+      copyToTopic: true,
       replyMarkup: approvalKeyboard(callbackId, approvalLabels(request)),
-      priority: 'high',
-      notify: true,
+      privateText: 'Codex needs approval. Use the approval buttons in the conversation topic.',
     });
   }
 
@@ -1158,6 +1156,28 @@ export class CodexTelegramTopicBridge {
     });
   }
 
+  async #sendAttentionNotice(threadId, text, { copyToTopic = false, replyMarkup = null, privateText = null } = {}) {
+    const messageThreadId = this.state.getTopicForThread(threadId);
+    if (!this.state.boundChatId || !messageThreadId) return;
+    if (!this.alertChatId || copyToTopic) {
+      await this.telegram.sendMessage({
+        chatId: this.state.boundChatId, messageThreadId, text, replyMarkup,
+        priority: 'high', notify: !this.alertChatId,
+      });
+    }
+    if (!this.alertChatId) return;
+    const title = String(this.state.getThread(threadId)?.title || threadId)
+      .replace(/[\\`*_{}\[\]()#+.!<>~-]/g, character => '\\' + character);
+    const groupId = /^-100(\d+)$/.exec(String(this.state.boundChatId))?.[1];
+    const link = groupId ? `\n\n[Open conversation](https://t.me/c/${groupId}/${messageThreadId})` : '';
+    const body = (privateText ?? text).replace('Reply in this topic', 'Reply in the conversation topic');
+    await this.telegram.sendMessage({
+      chatId: this.alertChatId,
+      text: `${body}\n\n**Conversation: ${title}**${link}`,
+      priority: 'high', notify: true,
+    });
+  }
+
   async #sendCompletionNotice(threadId, reason, detail = null, turnId = null) {
     const messageThreadId = this.state.getTopicForThread(threadId);
     if (!this.state.boundChatId || !messageThreadId) return;
@@ -1178,13 +1198,8 @@ export class CodexTelegramTopicBridge {
         ? this.telegram.pendingOutboundCount()
         : 0;
       const backlog = pending > 0 ? `\nTelegram backlog still sending: ${pending} queued item${pending === 1 ? '' : 's'}.` : '';
-      await this.telegram.sendMessage({
-        chatId: this.state.boundChatId,
-        messageThreadId,
-        text: withMessageType('task_complete', `Status: Codex task complete.${detail ? `\n${detail}` : ''}${backlog}\nReason: ${reason}`),
-        priority: 'high',
-        notify: true,
-      });
+      await this.#sendAttentionNotice(threadId,
+        withMessageType('task_complete', `Status: Codex task complete.${detail ? `\n${detail}` : ''}${backlog}\nReason: ${reason}`));
     } catch (error) {
       this.completionNotices.set(String(threadId), recent.filter(entry => entry !== notice));
       throw error;

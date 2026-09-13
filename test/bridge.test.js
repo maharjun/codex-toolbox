@@ -1198,6 +1198,9 @@ function memoryState() {
     getTopicForThread(threadId) {
       return this.data.threads[String(threadId)]?.messageThreadId ?? null;
     },
+    getThread(threadId) {
+      return this.data.threads[String(threadId)] ?? null;
+    },
     getThreadForTopic(topicId) {
       return this.data.topics[String(topicId)]?.threadId ?? null;
     },
@@ -1470,5 +1473,52 @@ test('disabled user mirroring filters live and session users but preserves agent
     await tick();
     assert.match(telegram.sent.at(-1).text,/Input needed/);
     assert.equal(telegram.sent.at(-1).notify,true);
+  } finally { await bridge.stop(); }
+});
+
+test('private alerts label current conversation and leave transcript and response controls in the topic', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-private-alert-'));
+  const file = join(dir, 'session.jsonl');
+  await writeFile(file, '');
+  const state = memoryState();
+  await state.bindChat(-10012345);
+  await state.mapThread('t1', 44, 'Original');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex({threads:[{id:'t1',title:'Original',source:'vscode',path:file,updatedAt:'1'}]});
+  let answer;
+  codex.answerUserInput = (id, answers) => { answer = {id, answers}; };
+  const bridge = new CodexTelegramTopicBridge({codex, telegram, state, alertChatId:'111111111', allowedUserIds:[111111111], messageScope:'conversation'});
+  await bridge.start();
+  try {
+    await appendFile(file, sessionLine('agent_message', {message:'Final result'})+'\n');
+    await bridge.discoverThreads();
+    await state.mapThread('t1', 44, 'Renamed *agent*');
+    codex.emit('event', {method:'turn/completed',threadId:'t1',turnId:'turn1',raw:{params:{}}});
+    await tick();
+    codex.emit('event', {method:'turn/completed',threadId:'t1',turnId:'turn1',raw:{params:{}}});
+    await tick();
+    await appendFile(file, sessionLine('task_complete', {turn_id:'turn1'})+'\n');
+    await bridge.discoverThreads();
+    assert.equal(telegram.sent.filter(m => m.notify).length, 1);
+    assert.ok(telegram.sent.some(m => m.chatId === '-10012345' && m.text.includes('Final result') && !m.notify));
+    const completion = telegram.sent.find(m => m.notify);
+    assert.equal(completion.chatId, '111111111');
+    assert.equal(completion.messageThreadId, undefined);
+    assert.ok(completion.text.includes('Renamed \\*agent\\*'));
+    assert.ok(completion.text.includes('https://t.me/c/12345/44'));
+    codex.emit('serverRequest', {id:9,method:'item/tool/requestUserInput',threadId:'t1',params:{questions:[{id:'q',question:'Which?',options:[{label:'First'}]}]}});
+    await tick();
+    telegram.emit('update', {message:allowedMessage({text:'1',chat:{id:-10012345,type:'supergroup'},is_topic_message:true,message_thread_id:44})});
+    await tick();
+    assert.deepEqual(answer, {id:9,answers:{q:{answers:['First']}}});
+    codex.emit('serverRequest', {id:10,method:'item/commandExecution/requestApproval',threadId:'t1',params:{command:'example'}});
+    await tick();
+    codex.emit('serverRequest', {id:11,method:'item/tool/requestUserInput',threadId:'t1',params:{questions:[{id:'secret',question:'Do not forward secret prompt',isSecret:true}]}});
+    await tick();
+    assert.equal(telegram.sent.filter(m => m.notify).length, 4);
+    assert.ok(telegram.sent.filter(m => m.chatId === '-10012345').every(m => !m.notify));
+    assert.ok(telegram.sent.some(m => m.chatId === '-10012345' && m.replyMarkup));
+    assert.ok(telegram.sent.filter(m => m.notify).every(m => !m.replyMarkup && !m.messageThreadId));
+    assert.ok(!telegram.sent.some(m => m.text.includes('Do not forward secret prompt')));
   } finally { await bridge.stop(); }
 });

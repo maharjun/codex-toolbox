@@ -27,6 +27,7 @@ test('launcher preserves proxy argument boundaries and consumes a token without 
     env,platform:'win32',home:'C:\\Users\\Test',execPath:'C:\\Program Files\\nodejs\\node.exe',proxyPath,
   });
   assert.equal(result.TELEGRAM_BOT_TOKEN,env.TELEGRAM_BOT_API_KEY);
+  assert.equal(result.TELEGRAM_ALERT_CHAT_ID,'123');
   assert.equal(env.TELEGRAM_BOT_TOKEN,undefined);
   assert.deepEqual(parseAppServerArgs(result),[proxyPath]);
   assert.equal(result.CODEX_APP_SERVER_COMMAND,'C:\\Program Files\\nodejs\\node.exe');

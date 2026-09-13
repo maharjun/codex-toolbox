@@ -91,3 +91,11 @@ Set `CODEX_TELEGRAM_TRACE_DELIVERY=1` in the launch environment to enable opt-in
 ## User-message mirroring
 
 Environment-based startup omits user messages from the Telegram transcript by default, for both live events and session logs. Agent messages, completion alerts, and input/approval requests remain enabled. Replies sent from Telegram still reach Codex. Set `CODEX_TELEGRAM_MIRROR_USER_MESSAGES=1` only if you want user messages mirrored again.
+
+## Private attention alerts
+
+The portable launcher sends completion, question, and approval alerts to the private bot chat of the configured `userId` on Windows and POSIX. Open that bot chat and press Start once before using alerts. Alerts show the current conversation name and a link to its group topic. Transcript messages remain silent in the group; silent messages can still appear in Telegram notifications. User messages are not mirrored by default.
+
+Answer questions and use approval buttons in the linked topic. Confidential input must still be entered in the terminal. Private chat replies are not routed to Codex conversations.
+
+For direct `src/index.js` startup, set `TELEGRAM_ALERT_CHAT_ID` to the intended private chat ID to enable this routing; without it alerts stay in the group. The local launcher derives it from `config.json` automatically.
