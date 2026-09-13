@@ -72,6 +72,11 @@ export class CodexAppServer extends EventEmitter {
     return dedupeThreads([...(extractThreads(threads)), ...(extractThreads(loaded))]);
   }
 
+  async readThread(threadId) {
+    const result = await this.client.request('thread/read', { threadId, includeTurns: false });
+    return result.thread;
+  }
+
   async resumeThread(threadId) {
     return this.client.request('thread/resume', { threadId });
   }

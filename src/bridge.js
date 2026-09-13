@@ -46,6 +46,8 @@ export class CodexTelegramTopicBridge {
     this.pendingResumeThreads = new Set();
     this.pendingQuestions = new Map();
     this.topicCreationFailures = new Set();
+    this.pendingTopicCreations = new Map();
+    this.threadMetadata = new Map();
     this.lastTopicCreationFailure = null;
     this.topicCreationPausedUntilMs = 0;
     this.lastTelegramError = null;
@@ -104,6 +106,11 @@ export class CodexTelegramTopicBridge {
     for (const thread of threads) {
       const threadId = thread.id ?? thread.threadId ?? thread.thread_id;
       if (!threadId) continue;
+      this.threadMetadata.set(String(threadId), thread);
+      if (isSubagentThread(thread)) {
+        stats.skipped += 1;
+        continue;
+      }
       stats.seen += 1;
       const threadKey = String(threadId);
       const sessionPath = thread.path ?? thread.rolloutPath ?? thread.rollout_path ?? null;
@@ -930,26 +937,59 @@ export class CodexTelegramTopicBridge {
 
   async #ensureTopicForThread(threadId, thread = null) {
     if (!this.state.boundChatId) return null;
+    const key = String(threadId);
+    if (thread) this.threadMetadata.set(key, thread);
+    if (isSubagentThread(this.threadMetadata.get(key))) return null;
+    const pending = this.pendingTopicCreations.get(key);
+    if (pending) return pending;
     const existingTopicId = this.state.getTopicForThread(threadId);
     if (existingTopicId) return existingTopicId;
     if (Date.now() < this.topicCreationPausedUntilMs) return null;
 
-    const title = thread?.name ?? thread?.title ?? `Codex ${String(threadId).slice(0, 8)}`;
+    // Install the promise before any lookup or Telegram request can yield.
+    const creation = Promise.resolve().then(() => this.#createTopicForThread(key));
+    this.pendingTopicCreations.set(key, creation);
     try {
-      const topicId = await this.telegram.createForumTopic(this.state.boundChatId, title);
+      return await creation;
+    } finally {
+      this.pendingTopicCreations.delete(key);
+    }
+  }
+
+  async #createTopicForThread(threadId) {
+    let thread = this.threadMetadata.get(threadId);
+    if (thread?.source == null) {
+      // Events can arrive before discovery. Never create a topic until we know
+      // whether this is a user conversation or a background sub-agent.
+      thread = await this.codex.readThread(threadId);
+      if (thread?.source == null) return null;
+      this.threadMetadata.set(threadId, thread);
+    }
+    if (isSubagentThread(thread)) return null;
+    const existingTopicId = this.state.getTopicForThread(threadId);
+    if (existingTopicId) return existingTopicId;
+    const title = thread.name ?? thread.title ?? `Codex ${String(threadId).slice(0, 8)}`;
+    let topicId;
+    try {
+      topicId = await this.telegram.createForumTopic(this.state.boundChatId, title);
       this.topicCreationFailures.delete(String(threadId));
       await this.state.mapThread(threadId, topicId, title);
-      await this.telegram.sendMessage({
-        chatId: this.state.boundChatId,
-        messageThreadId: topicId,
-        text: `Linked Codex thread ${threadId}`,
-      });
-      return topicId;
     } catch (error) {
       this.#pauseTopicCreationIfRateLimited(error);
       await this.#notifyTopicCreationFailure(threadId, title, error);
       return null;
     }
+    // A failed welcome message is not a topic-creation or permissions failure.
+    try {
+      await this.telegram.sendMessage({
+        chatId: this.state.boundChatId,
+        messageThreadId: topicId,
+        text: `Linked Codex thread ${threadId}`,
+      });
+    } catch (error) {
+      this.#logError(error);
+    }
+    return topicId;
   }
 
   async #notifyTopicCreationFailure(threadId, title, error) {
@@ -1730,4 +1770,11 @@ function formatDuration(durationMs) {
   const seconds = totalSeconds % 60;
   if (minutes <= 0) return `${seconds}s`;
   return `${minutes}m ${seconds}s`;
+}
+
+function isSubagentThread(thread) {
+  const source = thread?.source;
+  return typeof source === 'string'
+    ? /^sub_?agent/i.test(source)
+    : source != null && ('subagent' in source || 'subAgent' in source || 'sub_agent' in source);
 }

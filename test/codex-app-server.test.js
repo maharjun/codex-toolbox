@@ -36,3 +36,15 @@ test('rename failures propagate so Telegram cannot report a false success', asyn
   const server = new CodexAppServer({ client });
   await assert.rejects(server.renameThread('t1', 'New name'), /rename rejected/);
 });
+
+test('readThread fetches source metadata without loading turns', async () => {
+  const client = new EventEmitter();
+  const thread = { id: 'child', source: { subagent: { thread_spawn: { parent_thread_id: 'parent' } } } };
+  client.request = async (method, params) => {
+    assert.equal(method, 'thread/read');
+    assert.deepEqual(params, { threadId: 'child', includeTurns: false });
+    return { thread };
+  };
+  const server = new CodexAppServer({ client });
+  assert.deepEqual(await server.readThread('child'), thread);
+});

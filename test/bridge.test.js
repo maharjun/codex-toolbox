@@ -1175,6 +1175,7 @@ function fakeCodex({ threads = [] } = {}) {
   codex.start = async () => {};
   codex.stop = () => {};
   codex.listThreads = async () => codex.threads;
+  codex.readThread = async (threadId) => ({ source: 'cli', ...codex.threads.find(thread => thread.id === threadId), id: threadId });
   codex.resumeThread = async (threadId) => codex.resumed.push(threadId);
   codex.sendToThread = async (threadId, text) => codex.sent.push({ threadId, text });
   codex.createThread = async (title, options = {}) => {
@@ -1563,3 +1564,143 @@ test('private alerts label current conversation and leave transcript and respons
     assert.ok(!telegram.sent.some(m => m.text.includes('Do not forward secret prompt')));
   } finally { await bridge.stop(); }
 });
+
+test('discovery excludes sub-agent threads but creates topics for user threads', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  codex.threads = [
+    { id: 'child', source: { subagent: { thread_spawn: { parent_thread_id: 'parent' } } } },
+    { id: 'review', source: 'subAgentReview' },
+    { id: 'parent', source: 'cli', title: 'User conversation' },
+  ].map(thread => ({ ...thread, createdAt: Date.now() + 1000 }));
+  await bridge.discoverThreads();
+  assert.deepEqual(telegram.created.map(topic => topic.title), ['User conversation']);
+  assert.deepEqual(codex.resumed, ['parent']);
+});
+
+test('sub-agent events arriving before discovery do not create topics', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  let reads = 0;
+  codex.readThread = async () => {
+    reads += 1;
+    return { id: 'child', source: { subagent: { thread_spawn: { parent_thread_id: 'parent' } } } };
+  };
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  for (let i = 0; i < 20; i++) emitTopicEvent(codex, 'child', `message ${i}`);
+  await tick();
+  emitTopicEvent(codex, 'child', 'later message');
+  await tick();
+  assert.equal(reads, 1);
+  assert.deepEqual(telegram.created, []);
+  assert.equal(state.getTopicForThread('child'), null);
+});
+
+test('concurrent events and discovery share one pending topic creation', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  let finishCreation;
+  const gate = new Promise(resolve => { finishCreation = resolve; });
+  const create = telegram.createForumTopic;
+  telegram.createForumTopic = async (...args) => {
+    const id = await create(...args);
+    await gate;
+    return id;
+  };
+  let reads = 0;
+  codex.readThread = async () => { reads += 1; return { id: 'parent', source: 'cli' }; };
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state });
+  await bridge.start();
+  t.after(() => { finishCreation(); return bridge.stop(); });
+  for (let i = 0; i < 30; i++) emitTopicEvent(codex, 'parent', `message ${i}`);
+  await tick();
+  codex.threads = [{ id: 'parent', source: 'cli', createdAt: Date.now() + 1000 }];
+  const discovery = bridge.discoverThreads();
+  await tick();
+  assert.equal(reads, 1);
+  assert.equal(telegram.created.length, 1);
+  finishCreation();
+  await discovery;
+  await tick();
+  assert.equal(state.getTopicForThread('parent'), 1001);
+  assert.equal(telegram.created.length, 1);
+  assert.equal(telegram.sent.filter(message => message.text.startsWith('Linked Codex')).length, 1);
+  assert.equal(telegram.sent.filter(message => message.text.includes('message ')).length, 30);
+});
+
+test('a failed shared creation can be retried on later activity', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const create = telegram.createForumTopic;
+  let attempts = 0;
+  telegram.createForumTopic = async (...args) => {
+    if (++attempts === 1) throw new Error('temporary failure');
+    return create(...args);
+  };
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, logger: { error() {} } });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  for (let i = 0; i < 10; i++) emitTopicEvent(codex, 'parent', `first ${i}`);
+  await tick();
+  assert.equal(attempts, 1);
+  emitTopicEvent(codex, 'parent', 'retry');
+  await tick();
+  assert.equal(attempts, 2);
+  assert.equal(state.getTopicForThread('parent'), 1001);
+});
+
+test('missing source metadata prevents automatic topic creation', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  codex.readThread = async () => ({ id: 'unknown' });
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  emitTopicEvent(codex, 'unknown', 'hello');
+  await tick();
+  assert.deepEqual(telegram.created, []);
+});
+
+test('deleted welcome destination does not report a topic permissions failure or recreate', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const send = telegram.sendMessage;
+  telegram.sendMessage = async message => {
+    if (message.text.startsWith('Linked Codex')) throw new Error('Bad Request: message thread not found');
+    return send(message);
+  };
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, logger: { error() {} } });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  emitTopicEvent(codex, 'parent', 'first');
+  await tick();
+  emitTopicEvent(codex, 'parent', 'second');
+  await tick();
+  assert.equal(telegram.created.length, 1);
+  assert.equal(state.getTopicForThread('parent'), 1001);
+  assert.ok(telegram.sent.every(message => !message.text.includes('Make the bot an admin')));
+});
+
+function emitTopicEvent(codex, threadId, text) {
+  codex.emit('event', {
+    method: 'item/agentMessage/delta', threadId,
+    raw: { params: { threadId, role: 'assistant', text } },
+  });
+}
