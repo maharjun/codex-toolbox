@@ -36,6 +36,7 @@ export async function createBridge(options) {
     state,
     telegram: options.telegram ?? new TelegramClient({
       token: options.telegramToken,
+      traceDelivery: options.traceDelivery,
       minPrivateIntervalMs: options.telegramPrivateIntervalMs,
       minGroupIntervalMs: options.telegramGroupIntervalMs,
       minGlobalIntervalMs: options.telegramGlobalIntervalMs,
@@ -84,6 +85,7 @@ export function createBridgeFromEnv(env) {
         codexArgs,
         cwd: env.CODEX_APP_SERVER_CWD || process.cwd(),
         telegramToken: env.TELEGRAM_BOT_TOKEN,
+        traceDelivery: env.CODEX_TELEGRAM_TRACE_DELIVERY === '1',
         discordToken: env.DISCORD_BOT_TOKEN,
         allowedDiscordUserIds,
         discordGuildId: env.DISCORD_GUILD_ID,

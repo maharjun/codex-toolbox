@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import https from 'node:https';
+import { createHash } from 'node:crypto';
 import { renderTelegramMarkdown } from './telegram-markdown.js';
 
 export class TelegramClient extends EventEmitter {
@@ -11,10 +12,13 @@ export class TelegramClient extends EventEmitter {
     minGroupIntervalMs = 0,
     minGlobalIntervalMs = 0,
     retryBufferMs = 250,
+    traceDelivery = false,
   }) {
     super();
     if (!token) throw new Error('TELEGRAM_BOT_TOKEN is required');
     if (!fetchImpl) throw new Error('fetch is required');
+    this.traceDelivery = traceDelivery;
+    this.deliverySequence = 0;
     this.token = token;
     this.fetch = fetchImpl;
     this.pollTimeoutSeconds = pollTimeoutSeconds;
@@ -193,13 +197,28 @@ export class TelegramClient extends EventEmitter {
   }
 
   async #sendQueuedApi(method, payload, chatId) {
+    const sequence = ++this.deliverySequence;
+    const trace = (status, extra = {}) => {
+      if (!this.traceDelivery || !['sendMessage', 'editMessageText'].includes(method)) return;
+      const kind = payload.text?.startsWith('task_complete\n') ? 'completion'
+        : payload.disable_notification === false ? 'alert' : 'transcript';
+      this.emit('delivery', {
+        at: new Date().toISOString(), sequence, method, kind, status,
+        destination: createHash('sha256').update(`${chatId}:${payload.message_thread_id ?? ''}`).digest('hex').slice(0, 12),
+        silent: method === 'sendMessage' ? payload.disable_notification === true : null,
+        ...extra,
+      });
+    };
     while (true) {
       await this.#waitForSendSlot(chatId);
       try {
+        trace('sending');
         const result = await this.api(method, payload);
+        trace('accepted', { messageId: result?.message_id ?? payload.message_id ?? null });
         this.#reserveNextSlot(chatId);
         return result;
       } catch (error) {
+        trace(isRetryableRateLimit(error) ? 'rate_limited' : 'failed', { errorCode: Number(error.response?.error_code) || null });
         if (!isRetryableRateLimit(error)) throw error;
         const retryAfterMs = Math.max(0, Number(error.retryAfter) || 0) * 1000 + this.retryBufferMs;
         this.#reserveNextSlot(chatId, retryAfterMs);

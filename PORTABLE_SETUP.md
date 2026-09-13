@@ -81,3 +81,9 @@ node --test --test-isolation=none test/local-runtime.test.js test/telegram-markd
 ```
 
 Then test two conversations, a topic reply, a structured question, `/rename`, Markdown, silent progress, and one completion alert. Windows path behavior is tested on Linux; native Windows execution and attachment must still be verified on Windows.
+
+## Diagnose notification delivery
+
+Set `CODEX_TELEGRAM_TRACE_DELIVERY=1` in the launch environment to enable opt-in diagnostics. The bridge logs each send/edit attempt and acceptance/failure, the requested silent flag, a hashed destination, and Telegram's returned message ID. Completion receipt and duplicate suppression are logged separately. No message body, token, API URL, conversation title, raw chat ID, or server error description is included in these records. Other pre-existing application logs have their own behavior.
+
+`silent: true` requests silent delivery; `silent: false` requests a normal alert. Edits have `silent: null` because edits cannot request a new alert. An accepted API request does not prove that a phone displayed a notification or played a sound. Turn tracing off by removing the variable or setting it to `0` and restarting.

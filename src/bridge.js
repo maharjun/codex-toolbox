@@ -64,6 +64,7 @@ export class CodexTelegramTopicBridge {
   }
 
   async start() {
+    this.telegram.on('delivery', event => this.logger.info?.('Telegram delivery:', JSON.stringify(event)));
     this.telegram.on('update', (update) => this.#handleTelegramUpdate(update).catch((error) => this.#logError(error)));
     this.telegram.on('error', (error) => {
       this.lastTelegramError = error.message;
@@ -1165,6 +1166,7 @@ export class CodexTelegramTopicBridge {
     const duplicate = recent.some(entry => turnId && entry.turnId
       ? String(turnId) === String(entry.turnId)
       : now - entry.at < 10000);
+    if (this.telegram.traceDelivery) this.logger.info?.('Telegram completion:', JSON.stringify({source: reason, duplicate, hasTurnId: Boolean(turnId)}));
     if (duplicate) return;
     const notice = {turnId, at: now};
     recent.push(notice);

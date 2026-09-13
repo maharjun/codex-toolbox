@@ -180,3 +180,28 @@ test('parses commands and forum messages', () => {
   assert.equal(isForumMessage({ chat: { type: 'supergroup' }, is_topic_message: true }), true);
   assert.equal(sanitizeTopicName('  a   b  '), 'a b');
 });
+
+test('delivery trace reports actual notification flags without message content or credentials', async () => {
+  const traces=[];
+  const client=new TelegramClient({token:'private-token',traceDelivery:true,fetchImpl:async()=>({ok:true,json:async()=>({ok:true,result:{message_id:42}})})});
+  client.on('delivery',event=>traces.push(event));
+  await client.sendMessage({chatId:-12345,messageThreadId:88,text:'private-message'});
+  await client.sendMessage({chatId:-12345,messageThreadId:88,text:'task_complete\nprivate-message',notify:true});
+  await client.editMessageText({chatId:-12345,messageThreadId:88,messageId:42,text:'private-edit'});
+  const accepted=traces.filter(event=>event.status==='accepted');
+  assert.deepEqual(accepted.map(event=>event.silent),[true,false,null]);
+  assert.deepEqual(accepted.map(event=>event.kind),['transcript','completion','transcript']);
+  assert.ok(accepted.every(event=>event.messageId===42));
+  assert.ok(!JSON.stringify(traces).includes('private-'));
+  assert.ok(!JSON.stringify(traces).includes('-12345'));
+});
+
+test('delivery trace records failures without copying error text', async () => {
+  const traces=[];
+  const client=new TelegramClient({token:'private-token',traceDelivery:true,fetchImpl:async()=>({ok:false,json:async()=>({ok:false,error_code:403,description:'private-error'})})});
+  client.on('delivery',event=>traces.push(event));
+  await assert.rejects(client.sendMessage({chatId:-1,text:'private-message',notify:true}));
+  assert.equal(traces.at(-1).status,'failed');
+  assert.equal(traces.at(-1).errorCode,403);
+  assert.ok(!JSON.stringify(traces).includes('private-'));
+});
