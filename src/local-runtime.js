@@ -45,7 +45,7 @@ export function launcherEnv(config, { env = process.env, platform = process.plat
     CODEX_APP_SERVER_COMMAND: execPath,
     CODEX_APP_SERVER_ARGS_JSON: JSON.stringify([proxyPath]),
     CODEX_APP_SERVER_CWD: config.cwd,
-    CODEX_TELEGRAM_MESSAGE_SCOPE: env.CODEX_TELEGRAM_MESSAGE_SCOPE || 'afk',
+    CODEX_TELEGRAM_MESSAGE_SCOPE: env.CODEX_TELEGRAM_MESSAGE_SCOPE || 'conversation',
   };
   if (!result.CODEX_APP_SERVER_URL && config.codexEndpoint) result.CODEX_APP_SERVER_URL = config.codexEndpoint;
   // Validate before the bridge starts polling Telegram.

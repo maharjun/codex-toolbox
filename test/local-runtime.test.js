@@ -32,7 +32,7 @@ test('launcher preserves proxy argument boundaries and consumes a token without 
   assert.deepEqual(parseAppServerArgs(result),[proxyPath]);
   assert.equal(result.CODEX_APP_SERVER_COMMAND,'C:\\Program Files\\nodejs\\node.exe');
   assert.equal(result.CODEX_APP_SERVER_URL,'ws://127.0.0.1:4600');
-  assert.equal(result.CODEX_TELEGRAM_MESSAGE_SCOPE,'afk');
+  assert.equal(result.CODEX_TELEGRAM_MESSAGE_SCOPE,'conversation');
 });
 
 test('invalid config and arguments fail without reflecting supplied values', () => {

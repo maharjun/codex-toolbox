@@ -150,7 +150,7 @@ function splitCsv(value) {
 
 function normalizeMessageScope(value) {
   const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'afk') return 'afk';
+  if (normalized === 'afk') return 'conversation';
   if (['all', 'everything', '*'].includes(normalized)) return 'all';
   if (['none', 'off', 'disabled', 'false', '0'].includes(normalized)) return 'none';
   if (['conversation', 'conversation_only', 'conversation-only', 'user_agent', 'user-agent', 'users_agents', 'users-agents', 'messages'].includes(normalized)) return 'conversation';

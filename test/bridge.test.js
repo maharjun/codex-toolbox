@@ -298,7 +298,7 @@ test('CLI session tailing does not duplicate messages already mirrored from app-
   assert.deepEqual(telegram.sent.map((message) => message.text), ['agentMessage\nCodex\nsame answer']);
 });
 
-test('newly discovered CLI session files mirror existing first turn after topic creation', async () => {
+test('newly discovered CLI session files do not replay history after topic creation', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-toolbox-cli-'));
   const file = join(dir, 'session.jsonl');
   await writeFile(file, `${sessionLine('user_message', { message: 'first prompt' })}\n${sessionLine('agent_message', { message: 'first answer' })}\n`, 'utf8');
@@ -320,8 +320,6 @@ test('newly discovered CLI session files mirror existing first turn after topic 
   assert.equal(state.getTopicForThread('cli-thread'), 1001);
   assert.deepEqual(telegram.sent.map((message) => message.text), [
     'Linked Codex thread cli-thread',
-    'user_message\nUser\nfirst prompt',
-    'agent_message\nCodex\nfirst answer',
   ]);
 });
 
@@ -689,7 +687,7 @@ test('/status reports bridge state', async () => {
   assert.match(status, /Codex Toolbox status/);
   assert.match(status, /Bound group: -100/);
   assert.match(status, /Mapped threads: 1/);
-  assert.match(status, /Mirroring paused: no/);
+  assert.match(status, /Transcript streaming paused: no/);
   assert.match(status, /Pending approvals: 0/);
   assert.match(status, /Allowed users: 111111111/);
 });
@@ -1711,6 +1709,40 @@ function emitTopicEvent(codex, threadId, text) {
   });
 }
 
+test('pause retains alerts and resume skips unread transcript history from the paused interval', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-stream-toggle-'));
+  const file = join(dir, 'session.jsonl');
+  await writeFile(file, '');
+  const state = memoryState();
+  await state.bindChat(-10012345);
+  await state.mapThread('t1',44,'One');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex({threads:[{id:'t1',source:'cli',path:file,title:'One'}]});
+  const bridge = new CodexTelegramTopicBridge({codex,telegram,state,messageScope:'conversation',alertChatId:'111',allowedUserIds:[111111111]});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  const command = text => telegram.emit('update',{message:allowedMessage({text,chat:{id:111111111,type:'private'}})});
+  command('/pause');
+  await tick();
+  emitTopicEvent(codex,'t1','Hidden while paused');
+  codex.emit('event',{method:'turn/completed',threadId:'t1',turnId:'paused-turn',raw:{params:{}}});
+  codex.emit('serverRequest',{id:9,method:'item/tool/requestUserInput',threadId:'t1',params:{questions:[{id:'q',question:'Still need your input?'}]}});
+  await tick();
+  assert.ok(!telegram.sent.some(m => m.text.includes('Hidden while paused')));
+  assert.ok(telegram.sent.some(m => m.chatId === '111' && m.text.includes('task complete')));
+  assert.ok(telegram.sent.some(m => m.text.includes('Still need your input?')));
+  const oldLine = JSON.parse(responseMessageLine('assistant','Unread paused history'));
+  oldLine.timestamp = '2000-01-01T00:00:00.000Z';
+  await appendFile(file,JSON.stringify(oldLine)+'\n');
+  command('/resume');
+  await tick();
+  await bridge.discoverThreads();
+  assert.ok(!telegram.sent.some(m => m.text.includes('Unread paused history')));
+  await appendFile(file,responseMessageLine('assistant','New desktop progress')+'\n');
+  await bridge.discoverThreads();
+  assert.ok(telegram.sent.some(m => m.text.includes('New desktop progress')));
+});
+
 function missingTopicError(description = 'Bad Request: message thread not found') {
   return Object.assign(new Error(description), {response:{error_code:400}});
 }
@@ -1845,7 +1877,7 @@ test('rename recovers a deleted Telegram topic and updates the replacement title
   assert.equal(telegram.edited.at(-1).messageThreadId,1001);
 });
 
-test('AFK mode keeps desktop replies local but delivers Telegram turn replies and attention requests', async (t) => {
+test('streaming includes both desktop and Telegram turns and preserves attention requests', async (t) => {
   const state = memoryState();
   await state.bindChat(-100);
   await state.mapThread('t1', 44, 'One');
@@ -1859,7 +1891,7 @@ test('AFK mode keeps desktop replies local but delivers Telegram turn replies an
   answer('desktop', 'Desktop answer');
   codex.emit('event', {method:'turn/completed',threadId:'t1',turnId:'desktop',raw:{params:{}}});
   await tick();
-  assert.ok(!telegram.sent.some(m => m.text.includes('Desktop answer')));
+  assert.ok(telegram.sent.some(m => m.text.includes('Desktop answer')));
   assert.equal(telegram.sent.filter(m => m.notify).length, 1);
   codex.sendToThread = async (threadId, text) => {
     codex.sent.push({threadId, text});
@@ -1876,11 +1908,11 @@ test('AFK mode keeps desktop replies local but delivers Telegram turn replies an
   codex.emit('serverRequest', {id:9,method:'item/tool/requestUserInput',threadId:'t1',params:{questions:[{id:'q',question:'Which option?'}]}});
   await tick();
   assert.ok(telegram.sent.some(m => m.text.includes('Remote final')));
-  assert.ok(!telegram.sent.some(m => m.text.includes('Next desktop answer')));
+  assert.ok(telegram.sent.some(m => m.text.includes('Next desktop answer')));
   assert.ok(telegram.sent.some(m => m.text.includes('Which option?')));
 });
 
-test('AFK discovery skips history and session tail forwards only Telegram turns plus completion alerts', async (t) => {
+test('discovery skips history and session tail forwards both desktop and Telegram turns', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-afk-'));
   const file = join(dir, 'session.jsonl');
   await writeFile(file, responseMessageLine('assistant', 'Old history')+'\n'+sessionLine('task_complete',{turn_id:'old'})+'\n');
@@ -1900,7 +1932,7 @@ test('AFK discovery skips history and session tail forwards only Telegram turns 
   await appendFile(file, [sessionLine('task_started',{turn_id:'desktop'}),responseMessageLine('assistant','Desktop log'),
     sessionLine('task_started',{turn_id:'remote'}),responseMessageLine('assistant','Remote log'),sessionLine('task_complete',{turn_id:'remote'})].join('\n')+'\n');
   await bridge.discoverThreads();
-  assert.ok(!telegram.sent.some(m => m.text.includes('Desktop log')));
+  assert.ok(telegram.sent.some(m => m.text.includes('Desktop log')));
   assert.ok(telegram.sent.some(m => m.text.includes('Remote log')));
   assert.equal(telegram.sent.filter(m => m.notify).length, 1);
 });

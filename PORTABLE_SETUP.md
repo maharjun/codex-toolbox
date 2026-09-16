@@ -90,18 +90,19 @@ Set `CODEX_TELEGRAM_TRACE_DELIVERY=1` in the launch environment to enable opt-in
 
 ## User-message mirroring
 
-The portable launcher defaults to `CODEX_TELEGRAM_MESSAGE_SCOPE=afk`. Computer-side
-conversation text and historical transcripts are not copied to Telegram. Completion
-alerts, questions and approval requests remain enabled. Send a message in a mapped
-topic to continue that same Codex conversation: assistant messages from that turn
-are delivered to the topic. A subsequent computer-started turn stays local again.
-Answering a question or approval in Telegram also enables replies for that active
-turn when its ID is known. Remote-turn tracking resets when the bridge restarts;
-send another topic message to resume receiving answers. Private messages are still
-alerts only, not a place to send conversation replies.
+The portable launcher streams new assistant messages to topics by default, whether
+input came from the computer or Telegram. Completed progress messages and final
+answers are forwarded; individual token deltas are not sent. New topic mappings
+start at the current end of the session log and never replay old history.
 
-Set `CODEX_TELEGRAM_MESSAGE_SCOPE=conversation` before starting the launcher to
-restore full conversation mirroring. Restart the bridge after changing this setting.
+Send /pause to the bot (in private chat or the bound group) to stop transcript
+streaming for all conversations managed by this bridge. Send /resume to stream
+new messages from that point onward, without replaying the paused interval.
+Completion alerts, questions, approval controls, and Telegram replies continue to
+work while streaming is paused. The pause setting persists across bridge restarts.
+Private chat carries alerts/commands; conversation replies belong in group topics.
+The former afk message-scope value is treated as conversation for compatibility;
+message origin no longer determines whether an answer is forwarded.
 
 ### Rename and clean up topics
 
@@ -116,7 +117,7 @@ restore full conversation mirroring. Restart the bridge after changing this sett
   mapping and retries the operation once. Concurrent failures share a single
   replacement, and replies there continue the same Codex conversation. No old
   transcript is replayed by recovery.
-- Private AFK alerts check their destination topic before including a link, so
+- Private completion alerts check their destination topic before including a link, so
   completion alerts also recover deleted topics even without transcript mirroring.
   The check uses `editForumTopic` without name/icon changes (see the
   [Telegram API](https://core.telegram.org/bots/api#editforumtopic)).
@@ -131,7 +132,7 @@ restore full conversation mirroring. Restart the bridge after changing this sett
 - Archiving/deleting a conversation in Codex does not automatically delete its
   Telegram topic. The bridge does not implement automatic cleanup for that direction.
 
-AFK mode applies to future delivery. Existing Telegram history is not removed.
+Streaming changes apply to future delivery. Existing Telegram history is not removed.
 
 Environment-based startup omits user messages from the Telegram transcript by default, for both live events and session logs. Agent messages, completion alerts, and input/approval requests remain enabled. Replies sent from Telegram still reach Codex. Set `CODEX_TELEGRAM_MIRROR_USER_MESSAGES=1` only if you want user messages mirrored again.
 

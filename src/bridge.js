@@ -23,8 +23,8 @@ const TELEGRAM_COMMANDS = [
   { command: 'status', description: 'Show bridge status' },
   { command: 'interrupt', description: 'Interrupt the current Codex turn' },
   { command: 'rename', description: 'Rename this topic' },
-  { command: 'pause', description: 'Pause Codex-to-Telegram mirroring' },
-  { command: 'resume', description: 'Resume mirroring' },
+  { command: 'pause', description: 'Pause transcript streaming; keep alerts' },
+  { command: 'resume', description: 'Stream new messages without history' },
   { command: 'help', description: 'Show commands and workflow' },
 ];
 
@@ -53,11 +53,8 @@ export class CodexTelegramTopicBridge {
     this.didInitialDiscovery = false;
     this.knownThreadUpdatedAt = new Map();
     this.startedAtMs = Date.now();
+    this.streamingSinceMs = this.startedAtMs;
     this.agentMessageBuffers = new Map();
-    this.telegramTurns = new Map();
-    this.pendingTelegramTurns = new Set();
-    this.liveTurnIds = new Map();
-    this.sessionTurnIds = new Map();
     this.telegramEchoSuppressions = new Map();
     this.recentMirroredMessages = new Map();
     this.completionNotices = new Map();
@@ -89,10 +86,14 @@ export class CodexTelegramTopicBridge {
       if (info?.reconnect) this.discoverThreads().catch((error) => this.#logError(error));
     });
 
+    if (this.telegram.traceDelivery) this.logger.info?.('Bridge startup: connecting to Codex');
     await this.codex.start();
+    if (this.telegram.traceDelivery) this.logger.info?.('Bridge startup: Codex connected');
     await this.#installTelegramCommandMenu();
+    if (this.telegram.traceDelivery) this.logger.info?.('Bridge startup: Telegram commands installed');
     await this.discoverThreads();
     this.discoveryTimer = setInterval(() => this.discoverThreads().catch((error) => this.#logError(error)), this.pollMs);
+    if (this.telegram.traceDelivery) this.logger.info?.('Bridge startup: discovery complete; polling Telegram');
     this.telegram.startPolling().catch((error) => this.#logError(error));
   }
 
@@ -143,7 +144,7 @@ export class CodexTelegramTopicBridge {
       if (isNewlyDiscovered || isOldThreadWithNewActivity) {
         const topicId = await this.#ensureTopicForThread(threadId, thread);
         if (topicId && shouldPollSessionFile && !this.sessionFileOffsets.has(threadKey)) {
-          await this.#initializeSessionFileOffset(threadKey, sessionPath, this.messageScope === 'afk' ? 'end' : 'start');
+          await this.#initializeSessionFileOffset(threadKey, sessionPath, 'end');
         }
         if (topicId && !this.subscribedThreads.has(threadKey)) {
           if (this.#queueResumeThreadForSubscription(threadId)) {
@@ -294,7 +295,7 @@ export class CodexTelegramTopicBridge {
     const lines = [
       'Codex Toolbox status',
       `Bound group: ${this.state.boundChatId ?? 'not bound'}`,
-      `Mirroring paused: ${this.state.data.paused?.mirroring ? 'yes' : 'no'}`,
+      `Transcript streaming paused: ${this.state.data.paused?.mirroring ? 'yes' : 'no'}`,
       `Message scope: ${this.messageScope}`,
       `Mapped threads: ${mappedThreadCount}`,
       `Mapped topics: ${mappedTopicCount}`,
@@ -428,13 +429,15 @@ export class CodexTelegramTopicBridge {
 
   async #pause(message) {
     await this.state.setMirroringPaused(true);
-    await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id, text: 'Codex-to-Telegram mirroring paused. Telegram replies and admin commands still work.' });
+    await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id, text: 'Transcript streaming paused for all conversations on this bridge. Completion alerts, questions, approvals, and Telegram input remain enabled.' });
   }
 
   async #resume(message) {
+    this.streamingSinceMs = Date.now();
+    this.agentMessageBuffers.clear();
     await this.state.setMirroringPaused(false);
     const stats = await this.discoverThreads();
-    await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id, text: `Mirroring resumed. Resync: seen ${stats.seen}, created ${stats.created}, resumed ${stats.resumed}, skipped ${stats.skipped}.` });
+    await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id, text: `Transcript streaming resumed from now, without history replay. Resync: seen ${stats.seen}, created ${stats.created}, resumed ${stats.resumed}, skipped ${stats.skipped}.` });
   }
 
   async #rename(message) {
@@ -497,7 +500,6 @@ export class CodexTelegramTopicBridge {
     try {
       const pending = this.pendingQuestions.get(String(threadId));
       if (pending) {
-        this.#rememberTelegramTurn(threadId, pending.request.params.turnId ?? this.liveTurnIds.get(String(threadId)) ?? this.codex.activeTurns?.get(String(threadId)));
         const question = pending.request.params.questions[pending.index];
         const selected = /^\d+$/.test(message.text.trim()) ? question.options?.[Number(message.text.trim()) - 1]?.label : null;
         pending.answers[question.id] = { answers: [selected ?? message.text] };
@@ -512,13 +514,7 @@ export class CodexTelegramTopicBridge {
         return;
       }
       this.#rememberTelegramEchoSuppression(threadId, message.text);
-      this.pendingTelegramTurns.add(String(threadId));
-      try {
-        const result = await this.codex.sendToThread(threadId, message.text);
-        this.#rememberTelegramTurn(threadId, result?.turn?.id ?? result?.turnId ?? this.codex.activeTurns?.get(String(threadId)) ?? this.liveTurnIds.get(String(threadId)));
-      } finally {
-        this.pendingTelegramTurns.delete(String(threadId));
-      }
+      await this.codex.sendToThread(threadId, message.text);
     } catch (error) {
       this.#forgetTelegramEchoSuppression(threadId, message.text);
       const text = error.steerRejected
@@ -541,7 +537,6 @@ export class CodexTelegramTopicBridge {
       await this.telegram.answerCallbackQuery(callback.id, 'Approval request expired.');
       return;
     }
-    this.#rememberTelegramTurn(approval.threadId, approval.turnId ?? this.liveTurnIds.get(String(approval.threadId)) ?? this.codex.activeTurns?.get(String(approval.threadId)));
     this.codex.answerServerRequest(approval.requestId, decision, { threadId: approval.threadId });
     await this.telegram.answerCallbackQuery(callback.id, `Sent ${decision}.`);
   }
@@ -772,12 +767,6 @@ export class CodexTelegramTopicBridge {
 
   async #mirrorCodexEvent(event) {
     if (!this.state.boundChatId || !event.threadId) return;
-    const threadKey = String(event.threadId);
-    const turnId = event.turnId ?? event.raw?.params?.turnId ?? event.raw?.params?.turn?.id;
-    if (event.method === 'turn/started' && turnId) {
-      this.liveTurnIds.set(threadKey, String(turnId));
-      if (this.pendingTelegramTurns.has(threadKey)) this.#rememberTelegramTurn(threadKey, turnId);
-    }
     if (event.method === 'serverRequest/resolved') {
       const pending = this.pendingQuestions.get(String(event.threadId));
       if (pending && pending.request.id === event.raw?.params?.requestId) {
@@ -794,16 +783,12 @@ export class CodexTelegramTopicBridge {
     if (this.#consumeTelegramEchoSuppression(event)) {
       return;
     }
-    if (this.state.data.paused?.mirroring) {
-      if (this.#shouldMirrorAllMessages()) await this.#debugMirrorSkip(event.threadId, 'mirroring is paused', event.method);
-      return;
-    }
     if (isCompletionEvent(event)) {
-      if (this.messageScope === 'afk') await this.#ensureTopicForThread(event.threadId);
+      await this.#ensureTopicForThread(event.threadId);
       await this.#sendCompletionNotice(event.threadId, 'app-server turn completed', null, event.turnId ?? event.raw?.params?.turn?.id ?? event.raw?.params?.turnId);
       return;
     }
-    if (this.messageScope === 'afk' && !this.#isTelegramTurn(threadKey, turnId ?? this.liveTurnIds.get(threadKey))) return;
+    if (this.state.data.paused?.mirroring) return;
     if (this.#bufferAgentMessageDelta(event)) return;
     const completedAgentMessage = this.#takeCompletedAgentMessage(event);
     if (completedAgentMessage) {
@@ -853,7 +838,7 @@ export class CodexTelegramTopicBridge {
       return;
     }
     if (!this.state.boundChatId) return;
-    if (this.messageScope === 'afk' && request.threadId) await this.#ensureTopicForThread(request.threadId);
+    if (request.threadId) await this.#ensureTopicForThread(request.threadId);
     const messageThreadId = request.threadId ? this.state.getTopicForThread(request.threadId) : null;
     if (!messageThreadId) return;
     const callbackId = randomUUID();
@@ -867,14 +852,6 @@ export class CodexTelegramTopicBridge {
 
   async #pollSessionFiles() {
     if (this.#shouldMirrorNoMessages()) return;
-    if (this.state.data.paused?.mirroring) {
-      if (this.#shouldMirrorAllMessages()) {
-        for (const threadId of this.sessionFilePaths.keys()) {
-          await this.#debugMirrorSkip(threadId, 'session file polling skipped because mirroring is paused');
-        }
-      }
-      return;
-    }
     for (const [threadId, sessionPath] of this.sessionFilePaths.entries()) {
       if (!this.state.getTopicForThread(threadId)) continue;
       try {
@@ -896,25 +873,20 @@ export class CodexTelegramTopicBridge {
       if (info.size < currentOffset) this.sessionFileOffsets.set(threadId, info.size);
       return;
     }
+    const mirrorTranscript = !this.state.data.paused?.mirroring;
     const raw = await readFile(sessionPath);
     const chunk = raw.subarray(currentOffset).toString('utf8');
     this.sessionFileOffsets.set(threadId, raw.length);
     for (const line of chunk.split('\n')) {
       if (!line.trim()) continue;
-      if (this.messageScope === 'afk') {
-        let entry;
-        try { entry = JSON.parse(line); } catch { continue; }
-        const payload = entry.payload ?? {};
-        if (entry.type === 'turn_context' || (entry.type === 'event_msg' && payload.type === 'task_started')) {
-          if (payload.turn_id) this.sessionTurnIds.set(String(threadId), String(payload.turn_id));
-        }
-        const completion = entry.type === 'event_msg' && payload.type === 'task_complete';
-        if (!completion && !this.#isTelegramTurn(threadId, payload.turn_id ?? this.sessionTurnIds.get(String(threadId)))) continue;
-      }
       const rendered = renderSessionLogLine(line, this.messageScope);
       if (!rendered.text) {
         if (this.#shouldMirrorAllMessages() && rendered.debugReason) await this.#debugMirrorSkip(threadId, rendered.debugReason);
         continue;
+      }
+      if (rendered.priority !== 'high') {
+        const timestamp = Date.parse(JSON.parse(line).timestamp);
+        if (!mirrorTranscript || this.state.data.paused?.mirroring || !Number.isFinite(timestamp) || timestamp < this.streamingSinceMs) continue;
       }
       const text = rendered.text;
       const mirroredUserText = mirroredRoleText(text, 'User');
@@ -1064,19 +1036,6 @@ export class CodexTelegramTopicBridge {
     return this.messageScope === 'all';
   }
 
-  #rememberTelegramTurn(threadId, turnId) {
-    if (!turnId) return;
-    const key = String(threadId);
-    const turns = this.telegramTurns.get(key) ?? new Set();
-    turns.add(String(turnId));
-    if (turns.size > 100) turns.delete(turns.values().next().value);
-    this.telegramTurns.set(key, turns);
-  }
-
-  #isTelegramTurn(threadId, turnId) {
-    return Boolean(turnId && this.telegramTurns.get(String(threadId))?.has(String(turnId)));
-  }
-
   #shouldMirrorNoMessages() {
     return this.messageScope === 'none';
   }
@@ -1084,7 +1043,7 @@ export class CodexTelegramTopicBridge {
   async #readDiagnostics() {
     const sections = [
       'Codex Toolbox diagnostics',
-      `Mirroring paused: ${this.state.data.paused?.mirroring ? 'yes' : 'no'}`,
+      `Transcript streaming paused: ${this.state.data.paused?.mirroring ? 'yes' : 'no'}`,
       `Mapped topics: ${Object.keys(this.state.data?.topics ?? {}).length}`,
       `Recent errors: ${this.#recentErrors().slice(-5).join(' | ') || 'none'}`,
     ];
@@ -1204,7 +1163,7 @@ export class CodexTelegramTopicBridge {
         priority: 'high', notify: !this.alertChatId,
       }));
     } else {
-      // AFK completion alerts go only to private chat. Check the linked topic first
+      // Completion alerts go only to private chat. Check the linked topic first
       // so deleting it cannot leave successful private alerts pointing to a dead link.
       messageThreadId = await this.#withTopicRecovery(threadId, topicId => this.telegram.checkForumTopic(this.state.boundChatId, topicId));
     }
@@ -1391,7 +1350,7 @@ function isUserOrAgentMessageEvent(event) {
 
 function normalizeMessageScope(value) {
   const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'afk') return 'afk';
+  if (normalized === 'afk') return 'conversation';
   if (['all', 'everything', '*'].includes(normalized)) return 'all';
   if (['none', 'off', 'disabled', 'false', '0'].includes(normalized)) return 'none';
   if (['conversation', 'conversation_only', 'conversation-only', 'user_agent', 'user-agent', 'users_agents', 'users-agents', 'messages'].includes(normalized)) return 'conversation';
@@ -1621,8 +1580,8 @@ function helpText() {
     '/unlink - remove mapping for this topic',
     '/relink <threadId> - link this topic to a Codex thread',
     '/resync - run discovery now',
-    '/pause - pause Codex-to-Telegram mirroring',
-    '/resume - resume mirroring',
+    '/pause - stop transcript streaming for this bridge; keep alerts',
+    '/resume - stream new messages from now without history',
     '/rename <title> - rename this topic and Codex thread',
     '/interrupt - interrupt this Codex thread',
     '/status - show bridge status',
