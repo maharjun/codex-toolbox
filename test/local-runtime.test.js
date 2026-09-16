@@ -32,7 +32,7 @@ test('launcher preserves proxy argument boundaries and consumes a token without 
   assert.deepEqual(parseAppServerArgs(result),[proxyPath]);
   assert.equal(result.CODEX_APP_SERVER_COMMAND,'C:\\Program Files\\nodejs\\node.exe');
   assert.equal(result.CODEX_APP_SERVER_URL,'ws://127.0.0.1:4600');
-  assert.equal(result.CODEX_TELEGRAM_MESSAGE_SCOPE,'conversation');
+  assert.equal(result.CODEX_TELEGRAM_MESSAGE_SCOPE,'afk');
 });
 
 test('invalid config and arguments fail without reflecting supplied values', () => {
@@ -40,6 +40,14 @@ test('invalid config and arguments fail without reflecting supplied values', () 
   assert.throws(()=>launcherEnv({userId:'bad',cwd:'relative'}, {env:{TELEGRAM_BOT_API_KEY:'test'}}),/numeric userId/);
   for (const value of ['broken','[123]','{}']) assert.throws(()=>parseAppServerArgs({CODEX_APP_SERVER_ARGS_JSON:value}),/JSON string array/);
   assert.deepEqual(parseAppServerArgs({CODEX_APP_SERVER_ARGS:'app-server "two words"'}),['app-server','two words']);
+});
+
+test('portable launcher permits opting back into conversation mirroring', () => {
+  const result = launcherEnv({userId:123,cwd:'C:\\Work'}, {
+    env:{TELEGRAM_BOT_API_KEY:'synthetic',CODEX_TELEGRAM_MESSAGE_SCOPE:'conversation'},
+    platform:'win32',proxyPath:'C:\\proxy.js',
+  });
+  assert.equal(result.CODEX_TELEGRAM_MESSAGE_SCOPE,'conversation');
 });
 
 test('proxy selects platform transport and validates network endpoints', () => {

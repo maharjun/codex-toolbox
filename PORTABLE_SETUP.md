@@ -90,6 +90,49 @@ Set `CODEX_TELEGRAM_TRACE_DELIVERY=1` in the launch environment to enable opt-in
 
 ## User-message mirroring
 
+The portable launcher defaults to `CODEX_TELEGRAM_MESSAGE_SCOPE=afk`. Computer-side
+conversation text and historical transcripts are not copied to Telegram. Completion
+alerts, questions and approval requests remain enabled. Send a message in a mapped
+topic to continue that same Codex conversation: assistant messages from that turn
+are delivered to the topic. A subsequent computer-started turn stays local again.
+Answering a question or approval in Telegram also enables replies for that active
+turn when its ID is known. Remote-turn tracking resets when the bridge restarts;
+send another topic message to resume receiving answers. Private messages are still
+alerts only, not a place to send conversation replies.
+
+Set `CODEX_TELEGRAM_MESSAGE_SCOPE=conversation` before starting the launcher to
+restore full conversation mirroring. Restart the bridge after changing this setting.
+
+### Rename and clean up topics
+
+- `/rename New name` inside a mapped topic renames the Codex conversation and its
+  Telegram topic. Names changed in Codex also sync to Telegram. Renaming a topic
+  through Telegram's own UI does not rename Codex; mappings use IDs, not names.
+- For one topic, send `/unlink` inside it and wait for confirmation before deleting
+  the topic in Telegram. This removes only the link; your Codex conversation stays
+  on the computer. New activity can create a fresh topic, so unlink is not a mute.
+- If you manually delete a linked topic, the bridge recreates it when a delivery
+  or rename receives Telegram's explicit missing-topic error. It saves the new
+  mapping and retries the operation once. Concurrent failures share a single
+  replacement, and replies there continue the same Codex conversation. No old
+  transcript is replayed by recovery.
+- Private AFK alerts check their destination topic before including a link, so
+  completion alerts also recover deleted topics even without transcript mirroring.
+  The check uses `editForumTopic` without name/icon changes (see the
+  [Telegram API](https://core.telegram.org/bots/api#editforumtopic)).
+- Network failures, permission errors, rate limits, and closed topics do not
+  trigger recreation. If creation fails, the error is recorded and new activity
+  can retry. Manual fallback: create a replacement and send `/relink <threadId>`;
+  `/topics` lists mapped IDs. Recovery preserves the Codex conversation, not the
+  deleted Telegram messages or old topic links.
+- `/delete_all_topics confirm` deletes every topic mapped by this bridge and
+  removes successful mappings, without deleting Codex conversations. Activity can
+  recreate topics. Failed deletions retain their mappings; check the command result.
+- Archiving/deleting a conversation in Codex does not automatically delete its
+  Telegram topic. The bridge does not implement automatic cleanup for that direction.
+
+AFK mode applies to future delivery. Existing Telegram history is not removed.
+
 Environment-based startup omits user messages from the Telegram transcript by default, for both live events and session logs. Agent messages, completion alerts, and input/approval requests remain enabled. Replies sent from Telegram still reach Codex. Set `CODEX_TELEGRAM_MIRROR_USER_MESSAGES=1` only if you want user messages mirrored again.
 
 ## Private attention alerts

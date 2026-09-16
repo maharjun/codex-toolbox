@@ -1203,6 +1203,7 @@ function fakeTelegram() {
   telegram.commands = [];
   telegram.startPolling = async () => {};
   telegram.stopPolling = () => {};
+  telegram.checkForumTopic = async () => true;
   telegram.createForumTopic = async (chatId, title) => {
     telegram.created.push({ chatId, title });
     return 1000 + telegram.created.length;
@@ -1709,3 +1710,197 @@ function emitTopicEvent(codex, threadId, text) {
     raw: { params: { threadId, role: 'assistant', text } },
   });
 }
+
+function missingTopicError(description = 'Bad Request: message thread not found') {
+  return Object.assign(new Error(description), {response:{error_code:400}});
+}
+
+test('deleted topic recovery shares one replacement across concurrent deliveries and preserves reply routing', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'One');
+  const telegram = fakeTelegram();
+  const send = telegram.sendMessage;
+  telegram.sendMessage = async message => {
+    if (message.messageThreadId === 44) throw missingTopicError();
+    return send(message);
+  };
+  const codex = fakeCodex({threads:[{id:'t1',title:'One',source:'cli'}]});
+  const bridge = new CodexTelegramTopicBridge({codex,telegram,state,allowedUserIds:[111111111]});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  emitTopicEvent(codex,'t1','First');
+  emitTopicEvent(codex,'t1','Second');
+  await tick();
+  assert.equal(telegram.created.length,1);
+  assert.equal(state.getTopicForThread('t1'),1001);
+  assert.equal(state.getThreadForTopic(44),null);
+  assert.ok(telegram.sent.some(m => m.messageThreadId === 1001 && m.text.includes('First')));
+  assert.ok(telegram.sent.some(m => m.messageThreadId === 1001 && m.text.includes('Second')));
+  telegram.emit('update',{message:allowedMessage({text:'Reply after recovery',chat:{id:-100,type:'supergroup'},is_topic_message:true,message_thread_id:1001})});
+  await tick();
+  assert.deepEqual(codex.sent,[{threadId:'t1',text:'Reply after recovery'}]);
+});
+
+test('AFK private completion checks deleted topic and links to its replacement', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-10012345);
+  await state.mapThread('t1',44,'One');
+  const telegram = fakeTelegram();
+  telegram.checkForumTopic = async (_, topic) => { if(topic === 44) throw missingTopicError('Bad Request: TOPIC_ID_INVALID'); };
+  const codex = fakeCodex({threads:[{id:'t1',title:'One',source:'cli'}]});
+  const bridge = new CodexTelegramTopicBridge({codex,telegram,state,messageScope:'afk',alertChatId:'111'});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  codex.emit('event',{method:'turn/completed',threadId:'t1',turnId:'turn1',raw:{params:{}}});
+  await tick();
+  const alert = telegram.sent.find(m => m.chatId === '111');
+  assert.ok(alert.text.includes('https://t.me/c/12345/1001'));
+  assert.equal(telegram.created.length,1);
+});
+
+test('completion waits for in-progress topic recovery instead of dropping its alert', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-10012345);
+  await state.mapThread('t1',44,'One');
+  const telegram = fakeTelegram();
+  const send = telegram.sendMessage;
+  telegram.sendMessage = async message => {
+    if(message.messageThreadId === 44) throw missingTopicError();
+    return send(message);
+  };
+  let release;
+  const create = telegram.createForumTopic;
+  telegram.createForumTopic = async (...args) => {
+    await new Promise(resolve => {release=resolve;});
+    return create(...args);
+  };
+  const codex = fakeCodex({threads:[{id:'t1',source:'cli',title:'One'}]});
+  const bridge = new CodexTelegramTopicBridge({codex,telegram,state,alertChatId:'111'});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  emitTopicEvent(codex,'t1','Answer');
+  await tick();
+  assert.equal(state.getTopicForThread('t1'),null);
+  codex.emit('event',{method:'turn/completed',threadId:'t1',turnId:'finished',raw:{params:{}}});
+  await tick();
+  release();
+  await tick();
+  assert.equal(telegram.created.length,1);
+  assert.ok(telegram.sent.some(m => m.chatId === '111' && m.text.includes('/12345/1001')));
+});
+
+test('topic recovery does not replace destinations for network, permission, rate limit, or closed-topic errors', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1',44,'One');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex({threads:[{id:'t1',source:'cli'}]});
+  const bridge = new CodexTelegramTopicBridge({codex,telegram,state,logger:{error(){}}});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  for (const [code, description] of [[undefined,'network timeout'],[403,'Forbidden'],[429,'Too Many Requests'],[400,'TOPIC_CLOSED'],[400,'chat not found']]) {
+    telegram.sendMessage = async () => {throw Object.assign(new Error(description),{response:{error_code:code}});};
+    emitTopicEvent(codex,'t1',description);
+    await tick();
+    assert.equal(state.getTopicForThread('t1'),44);
+  }
+  assert.equal(telegram.created.length,0);
+});
+
+test('topic recovery retries a delivery only once when the replacement also disappears', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1',44,'One');
+  const telegram = fakeTelegram();
+  telegram.sendMessage = async () => {throw missingTopicError('Bad Request: TOPIC_DELETED');};
+  const codex = fakeCodex({threads:[{id:'t1',source:'cli'}]});
+  const bridge = new CodexTelegramTopicBridge({codex,telegram,state,logger:{error(){}}});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  emitTopicEvent(codex,'t1','Answer');
+  await tick();
+  assert.equal(telegram.created.length,1);
+  assert.ok(state.data.lastErrors.length > 0);
+});
+
+test('rename recovers a deleted Telegram topic and updates the replacement title', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1',44,'One');
+  const telegram = fakeTelegram();
+  const edit = telegram.editForumTopic;
+  telegram.editForumTopic = async (chat,topic,title) => {
+    if(topic === 44) throw missingTopicError('Bad Request: TOPIC_ID_INVALID');
+    return edit(chat,topic,title);
+  };
+  const codex = fakeCodex({threads:[{id:'t1',title:'One',source:'cli'}]});
+  const bridge = new CodexTelegramTopicBridge({codex,telegram,state});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  codex.emit('event',{method:'thread/name/updated',threadId:'t1',raw:{params:{threadName:'New name'}}});
+  await tick();
+  assert.equal(state.getTopicForThread('t1'),1001);
+  assert.equal(state.getThread('t1').title,'New name');
+  assert.equal(telegram.edited.at(-1).messageThreadId,1001);
+});
+
+test('AFK mode keeps desktop replies local but delivers Telegram turn replies and attention requests', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('t1', 44, 'One');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex({ threads: [{id:'t1', source:'cli', title:'One'}] });
+  const bridge = new CodexTelegramTopicBridge({codex, telegram, state, messageScope:'afk', alertChatId:'111111111', allowedUserIds:[111111111]});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  const answer = (turnId, text) => codex.emit('event', {method:'item/completed', threadId:'t1', turnId,
+    raw:{params:{item:{id:text, type:'agentMessage', text}}}});
+  answer('desktop', 'Desktop answer');
+  codex.emit('event', {method:'turn/completed',threadId:'t1',turnId:'desktop',raw:{params:{}}});
+  await tick();
+  assert.ok(!telegram.sent.some(m => m.text.includes('Desktop answer')));
+  assert.equal(telegram.sent.filter(m => m.notify).length, 1);
+  codex.sendToThread = async (threadId, text) => {
+    codex.sent.push({threadId, text});
+    codex.emit('event', {method:'turn/started',threadId,turnId:'remote',raw:{params:{}}});
+    answer('remote', 'Immediate remote answer');
+    return {turn:{id:'remote'}};
+  };
+  telegram.emit('update', {message:allowedMessage({text:'Continue remotely',chat:{id:-100,type:'supergroup'},is_topic_message:true,message_thread_id:44})});
+  await tick();
+  assert.deepEqual(codex.sent, [{threadId:'t1',text:'Continue remotely'}]);
+  assert.ok(telegram.sent.some(m => m.text.includes('Immediate remote answer')));
+  answer('remote', 'Remote final');
+  answer('desktop-next', 'Next desktop answer');
+  codex.emit('serverRequest', {id:9,method:'item/tool/requestUserInput',threadId:'t1',params:{questions:[{id:'q',question:'Which option?'}]}});
+  await tick();
+  assert.ok(telegram.sent.some(m => m.text.includes('Remote final')));
+  assert.ok(!telegram.sent.some(m => m.text.includes('Next desktop answer')));
+  assert.ok(telegram.sent.some(m => m.text.includes('Which option?')));
+});
+
+test('AFK discovery skips history and session tail forwards only Telegram turns plus completion alerts', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-afk-'));
+  const file = join(dir, 'session.jsonl');
+  await writeFile(file, responseMessageLine('assistant', 'Old history')+'\n'+sessionLine('task_complete',{turn_id:'old'})+'\n');
+  const state = memoryState();
+  await state.bindChat(-100);
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const bridge = new CodexTelegramTopicBridge({codex, telegram, state, messageScope:'afk', allowedUserIds:[111111111]});
+  await bridge.start();
+  t.after(() => bridge.stop());
+  codex.threads = [{id:'t1',source:'cli',title:'One',path:file,createdAt:Date.now()+1000}];
+  await bridge.discoverThreads();
+  assert.ok(!telegram.sent.some(m => /Old history|task complete/.test(m.text)));
+  codex.sendToThread = async () => ({turn:{id:'remote'}});
+  telegram.emit('update', {message:allowedMessage({text:'Continue',chat:{id:-100,type:'supergroup'},is_topic_message:true,message_thread_id:1001})});
+  await tick();
+  await appendFile(file, [sessionLine('task_started',{turn_id:'desktop'}),responseMessageLine('assistant','Desktop log'),
+    sessionLine('task_started',{turn_id:'remote'}),responseMessageLine('assistant','Remote log'),sessionLine('task_complete',{turn_id:'remote'})].join('\n')+'\n');
+  await bridge.discoverThreads();
+  assert.ok(!telegram.sent.some(m => m.text.includes('Desktop log')));
+  assert.ok(telegram.sent.some(m => m.text.includes('Remote log')));
+  assert.equal(telegram.sent.filter(m => m.notify).length, 1);
+});

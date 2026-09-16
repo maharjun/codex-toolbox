@@ -45,6 +45,7 @@ export class CodexTelegramTopicBridge {
     this.pendingQuestions = new Map();
     this.topicCreationFailures = new Set();
     this.pendingTopicCreations = new Map();
+    this.pendingTopicRecoveries = new Map();
     this.threadMetadata = new Map();
     this.lastTopicCreationFailure = null;
     this.topicCreationPausedUntilMs = 0;
@@ -53,6 +54,10 @@ export class CodexTelegramTopicBridge {
     this.knownThreadUpdatedAt = new Map();
     this.startedAtMs = Date.now();
     this.agentMessageBuffers = new Map();
+    this.telegramTurns = new Map();
+    this.pendingTelegramTurns = new Set();
+    this.liveTurnIds = new Map();
+    this.sessionTurnIds = new Map();
     this.telegramEchoSuppressions = new Map();
     this.recentMirroredMessages = new Map();
     this.completionNotices = new Map();
@@ -138,7 +143,7 @@ export class CodexTelegramTopicBridge {
       if (isNewlyDiscovered || isOldThreadWithNewActivity) {
         const topicId = await this.#ensureTopicForThread(threadId, thread);
         if (topicId && shouldPollSessionFile && !this.sessionFileOffsets.has(threadKey)) {
-          await this.#initializeSessionFileOffset(threadKey, sessionPath, 'start');
+          await this.#initializeSessionFileOffset(threadKey, sessionPath, this.messageScope === 'afk' ? 'end' : 'start');
         }
         if (topicId && !this.subscribedThreads.has(threadKey)) {
           if (this.#queueResumeThreadForSubscription(threadId)) {
@@ -290,6 +295,7 @@ export class CodexTelegramTopicBridge {
       'Codex Toolbox status',
       `Bound group: ${this.state.boundChatId ?? 'not bound'}`,
       `Mirroring paused: ${this.state.data.paused?.mirroring ? 'yes' : 'no'}`,
+      `Message scope: ${this.messageScope}`,
       `Mapped threads: ${mappedThreadCount}`,
       `Mapped topics: ${mappedTopicCount}`,
       `Pending approvals: ${pendingApprovalCount}`,
@@ -451,14 +457,14 @@ export class CodexTelegramTopicBridge {
       return;
     }
     await this.#syncThreadName(threadId, title);
-    await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id,
-      text: `Renamed the Codex conversation to "${title}".` });
+    await this.#withTopicRecovery(threadId, topicId => this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: topicId,
+      text: `Renamed the Codex conversation to "${title}".` }));
   }
 
   async #syncThreadName(threadId, name) {
     const mapped = this.state.data.threads[String(threadId)];
     if (!mapped || !name || mapped.title === name) return;
-    await this.telegram.editForumTopic(this.state.boundChatId, mapped.messageThreadId, name);
+    await this.#withTopicRecovery(threadId, topicId => this.telegram.editForumTopic(this.state.boundChatId, topicId, name));
     await this.state.updateThreadTitle(threadId, name);
   }
 
@@ -491,6 +497,7 @@ export class CodexTelegramTopicBridge {
     try {
       const pending = this.pendingQuestions.get(String(threadId));
       if (pending) {
+        this.#rememberTelegramTurn(threadId, pending.request.params.turnId ?? this.liveTurnIds.get(String(threadId)) ?? this.codex.activeTurns?.get(String(threadId)));
         const question = pending.request.params.questions[pending.index];
         const selected = /^\d+$/.test(message.text.trim()) ? question.options?.[Number(message.text.trim()) - 1]?.label : null;
         pending.answers[question.id] = { answers: [selected ?? message.text] };
@@ -505,7 +512,13 @@ export class CodexTelegramTopicBridge {
         return;
       }
       this.#rememberTelegramEchoSuppression(threadId, message.text);
-      await this.codex.sendToThread(threadId, message.text);
+      this.pendingTelegramTurns.add(String(threadId));
+      try {
+        const result = await this.codex.sendToThread(threadId, message.text);
+        this.#rememberTelegramTurn(threadId, result?.turn?.id ?? result?.turnId ?? this.codex.activeTurns?.get(String(threadId)) ?? this.liveTurnIds.get(String(threadId)));
+      } finally {
+        this.pendingTelegramTurns.delete(String(threadId));
+      }
     } catch (error) {
       this.#forgetTelegramEchoSuppression(threadId, message.text);
       const text = error.steerRejected
@@ -528,6 +541,7 @@ export class CodexTelegramTopicBridge {
       await this.telegram.answerCallbackQuery(callback.id, 'Approval request expired.');
       return;
     }
+    this.#rememberTelegramTurn(approval.threadId, approval.turnId ?? this.liveTurnIds.get(String(approval.threadId)) ?? this.codex.activeTurns?.get(String(approval.threadId)));
     this.codex.answerServerRequest(approval.requestId, decision, { threadId: approval.threadId });
     await this.telegram.answerCallbackQuery(callback.id, `Sent ${decision}.`);
   }
@@ -758,6 +772,12 @@ export class CodexTelegramTopicBridge {
 
   async #mirrorCodexEvent(event) {
     if (!this.state.boundChatId || !event.threadId) return;
+    const threadKey = String(event.threadId);
+    const turnId = event.turnId ?? event.raw?.params?.turnId ?? event.raw?.params?.turn?.id;
+    if (event.method === 'turn/started' && turnId) {
+      this.liveTurnIds.set(threadKey, String(turnId));
+      if (this.pendingTelegramTurns.has(threadKey)) this.#rememberTelegramTurn(threadKey, turnId);
+    }
     if (event.method === 'serverRequest/resolved') {
       const pending = this.pendingQuestions.get(String(event.threadId));
       if (pending && pending.request.id === event.raw?.params?.requestId) {
@@ -779,9 +799,11 @@ export class CodexTelegramTopicBridge {
       return;
     }
     if (isCompletionEvent(event)) {
+      if (this.messageScope === 'afk') await this.#ensureTopicForThread(event.threadId);
       await this.#sendCompletionNotice(event.threadId, 'app-server turn completed', null, event.turnId ?? event.raw?.params?.turn?.id ?? event.raw?.params?.turnId);
       return;
     }
+    if (this.messageScope === 'afk' && !this.#isTelegramTurn(threadKey, turnId ?? this.liveTurnIds.get(threadKey))) return;
     if (this.#bufferAgentMessageDelta(event)) return;
     const completedAgentMessage = this.#takeCompletedAgentMessage(event);
     if (completedAgentMessage) {
@@ -831,10 +853,11 @@ export class CodexTelegramTopicBridge {
       return;
     }
     if (!this.state.boundChatId) return;
+    if (this.messageScope === 'afk' && request.threadId) await this.#ensureTopicForThread(request.threadId);
     const messageThreadId = request.threadId ? this.state.getTopicForThread(request.threadId) : null;
     if (!messageThreadId) return;
     const callbackId = randomUUID();
-    await this.state.rememberApproval(callbackId, { requestId: request.id, threadId: request.threadId });
+    await this.state.rememberApproval(callbackId, { requestId: request.id, threadId: request.threadId, turnId: request.params?.turnId });
     await this.#sendAttentionNotice(request.threadId, renderApprovalPrompt(request, { includeMessageType: true }), {
       copyToTopic: true,
       replyMarkup: approvalKeyboard(callbackId, approvalLabels(request)),
@@ -878,6 +901,16 @@ export class CodexTelegramTopicBridge {
     this.sessionFileOffsets.set(threadId, raw.length);
     for (const line of chunk.split('\n')) {
       if (!line.trim()) continue;
+      if (this.messageScope === 'afk') {
+        let entry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        const payload = entry.payload ?? {};
+        if (entry.type === 'turn_context' || (entry.type === 'event_msg' && payload.type === 'task_started')) {
+          if (payload.turn_id) this.sessionTurnIds.set(String(threadId), String(payload.turn_id));
+        }
+        const completion = entry.type === 'event_msg' && payload.type === 'task_complete';
+        if (!completion && !this.#isTelegramTurn(threadId, payload.turn_id ?? this.sessionTurnIds.get(String(threadId)))) continue;
+      }
       const rendered = renderSessionLogLine(line, this.messageScope);
       if (!rendered.text) {
         if (this.#shouldMirrorAllMessages() && rendered.debugReason) await this.#debugMirrorSkip(threadId, rendered.debugReason);
@@ -1031,6 +1064,19 @@ export class CodexTelegramTopicBridge {
     return this.messageScope === 'all';
   }
 
+  #rememberTelegramTurn(threadId, turnId) {
+    if (!turnId) return;
+    const key = String(threadId);
+    const turns = this.telegramTurns.get(key) ?? new Set();
+    turns.add(String(turnId));
+    if (turns.size > 100) turns.delete(turns.values().next().value);
+    this.telegramTurns.set(key, turns);
+  }
+
+  #isTelegramTurn(threadId, turnId) {
+    return Boolean(turnId && this.telegramTurns.get(String(threadId))?.has(String(turnId)));
+  }
+
   #shouldMirrorNoMessages() {
     return this.messageScope === 'none';
   }
@@ -1089,7 +1135,47 @@ export class CodexTelegramTopicBridge {
     if (this.#rememberMirroredMessage(threadId, text)) {
       return;
     }
-    await this.telegram.sendMessage({ chatId: this.state.boundChatId, messageThreadId, text });
+    try {
+      await this.#withTopicRecovery(threadId, topicId => this.telegram.sendMessage({ chatId: this.state.boundChatId, messageThreadId: topicId, text }));
+    } catch (error) {
+      const key = String(threadId);
+      this.recentMirroredMessages.set(key, (this.recentMirroredMessages.get(key) ?? [])
+        .filter(entry => entry.text !== normalizeMirroredMessageText(text)));
+      throw error;
+    }
+  }
+
+  async #withTopicRecovery(threadId, operation) {
+    const pendingRecovery = this.pendingTopicRecoveries.get(String(threadId));
+    if (pendingRecovery) await pendingRecovery;
+    const topicId = this.state.getTopicForThread(threadId);
+    if (!topicId) throw new Error('No Telegram topic is mapped for this conversation.');
+    try {
+      await operation(topicId);
+      return topicId;
+    } catch (error) {
+      if (!isMissingForumTopic(error)) throw error;
+      const replacement = await this.#recoverTopic(threadId, topicId);
+      // Retry once only; a second failure must not create a chain of topics.
+      await operation(replacement);
+      return replacement;
+    }
+  }
+
+  async #recoverTopic(threadId, missingTopicId) {
+    const key = String(threadId);
+    if (this.pendingTopicRecoveries.has(key)) return this.pendingTopicRecoveries.get(key);
+    const recovery = Promise.resolve().then(async () => {
+      const current = this.state.getTopicForThread(key);
+      if (current && String(current) !== String(missingTopicId)) return current;
+      if (current) await this.state.unmapThread(key);
+      const replacement = await this.#ensureTopicForThread(key);
+      if (!replacement) throw new Error('Deleted Telegram topic could not be recreated; retry on new conversation activity.');
+      return replacement;
+    });
+    this.pendingTopicRecoveries.set(key, recovery);
+    try { return await recovery; }
+    finally { this.pendingTopicRecoveries.delete(key); }
   }
 
   async #debugMirrorSkip(threadId, reason, detail = null) {
@@ -1108,13 +1194,19 @@ export class CodexTelegramTopicBridge {
   }
 
   async #sendAttentionNotice(threadId, text, { copyToTopic = false, replyMarkup = null, privateText = null } = {}) {
-    const messageThreadId = this.state.getTopicForThread(threadId);
+    const pendingRecovery = this.pendingTopicRecoveries.get(String(threadId));
+    if (pendingRecovery) await pendingRecovery;
+    let messageThreadId = this.state.getTopicForThread(threadId);
     if (!this.state.boundChatId || !messageThreadId) return;
     if (!this.alertChatId || copyToTopic) {
-      await this.telegram.sendMessage({
-        chatId: this.state.boundChatId, messageThreadId, text, replyMarkup,
+      messageThreadId = await this.#withTopicRecovery(threadId, topicId => this.telegram.sendMessage({
+        chatId: this.state.boundChatId, messageThreadId: topicId, text, replyMarkup,
         priority: 'high', notify: !this.alertChatId,
-      });
+      }));
+    } else {
+      // AFK completion alerts go only to private chat. Check the linked topic first
+      // so deleting it cannot leave successful private alerts pointing to a dead link.
+      messageThreadId = await this.#withTopicRecovery(threadId, topicId => this.telegram.checkForumTopic(this.state.boundChatId, topicId));
     }
     if (!this.alertChatId) return;
     const title = String(this.state.getThread(threadId)?.title || threadId)
@@ -1130,6 +1222,8 @@ export class CodexTelegramTopicBridge {
   }
 
   async #sendCompletionNotice(threadId, reason, detail = null, turnId = null) {
+    const pendingRecovery = this.pendingTopicRecoveries.get(String(threadId));
+    if (pendingRecovery) await pendingRecovery;
     const messageThreadId = this.state.getTopicForThread(threadId);
     if (!this.state.boundChatId || !messageThreadId) return;
     // Both app-server events and the session tail can report the same turn.
@@ -1297,6 +1391,7 @@ function isUserOrAgentMessageEvent(event) {
 
 function normalizeMessageScope(value) {
   const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'afk') return 'afk';
   if (['all', 'everything', '*'].includes(normalized)) return 'all';
   if (['none', 'off', 'disabled', 'false', '0'].includes(normalized)) return 'none';
   if (['conversation', 'conversation_only', 'conversation-only', 'user_agent', 'user-agent', 'users_agents', 'users-agents', 'messages'].includes(normalized)) return 'conversation';
@@ -1305,6 +1400,11 @@ function normalizeMessageScope(value) {
 
 function isRateLimited(error) {
   return Number(error?.retryAfter) > 0 || error?.response?.error_code === 429;
+}
+
+function isMissingForumTopic(error) {
+  return Number(error?.response?.error_code) === 400
+    && /\b(?:message thread not found|TOPIC_DELETED|TOPIC_ID_INVALID)\b/i.test(error.message ?? '');
 }
 
 function commandArgs(message, command) {

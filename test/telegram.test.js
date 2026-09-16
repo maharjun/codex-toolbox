@@ -51,6 +51,19 @@ test('deletes and edits forum topics', async () => {
   assert.equal(calls[1].body.name, 'renamed topic');
 });
 
+test('topic existence check keeps name and icon unchanged and accepts TOPIC_NOT_MODIFIED', async () => {
+  const bodies = [];
+  let description = 'Bad Request: TOPIC_NOT_MODIFIED';
+  const client = new TelegramClient({token:'test',fetchImpl:async (_,options) => {
+    bodies.push(JSON.parse(options.body));
+    return {ok:false,status:400,json:async () => ({ok:false,error_code:400,description})};
+  }});
+  assert.equal(await client.checkForumTopic(-100,44),true);
+  assert.deepEqual(bodies[0],{chat_id:-100,message_thread_id:44});
+  description = 'Bad Request: TOPIC_ID_INVALID';
+  await assert.rejects(client.checkForumTopic(-100,44),/TOPIC_ID_INVALID/);
+});
+
 test('edits message text', async () => {
   const calls = [];
   const client = new TelegramClient({

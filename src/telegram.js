@@ -68,6 +68,7 @@ export class TelegramClient extends EventEmitter {
       if (method === 'editMessageText' && /message is not modified/i.test(message)) {
         return true;
       }
+      if (method === 'editForumTopic' && response.body?.error_code === 400 && /\bTOPIC_NOT_MODIFIED\b/i.test(message)) return true;
       const error = new Error(message);
       error.response = response.body;
       error.retryAfter = response.body?.parameters?.retry_after;
@@ -96,6 +97,13 @@ export class TelegramClient extends EventEmitter {
       chat_id: chatId,
       message_thread_id: Number(messageThreadId),
       name: sanitizeTopicName(name),
+    }, { chatId });
+  }
+
+  async checkForumTopic(chatId, messageThreadId) {
+    // Omit both editable fields: verify the destination without changing its name/icon.
+    return this.queuedApi('editForumTopic', {
+      chat_id: chatId, message_thread_id: Number(messageThreadId),
     }, { chatId });
   }
 
