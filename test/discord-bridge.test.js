@@ -450,6 +450,10 @@ test('Discord tails mapped session files like Telegram', async () => {
 
   await bridge.start();
   await appendFile(file, `${sessionLine('user_message', { message: 'from cli' })}\n${sessionLine('agent_message', { message: 'from assistant' })}\n`, 'utf8');
+  await appendFile(file, JSON.stringify({
+    type: 'response_item',
+    payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'from assistant\n<oai-mem-citation>memory reference</oai-mem-citation>' }] },
+  })+'\n', 'utf8');
   await bridge.discoverThreads();
   await bridge.stop();
 

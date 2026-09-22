@@ -142,10 +142,10 @@ export class CodexTelegramTopicBridge {
       }
 
       if (isNewlyDiscovered || isOldThreadWithNewActivity) {
-        const topicId = await this.#ensureTopicForThread(threadId, thread);
-        if (topicId && shouldPollSessionFile && !this.sessionFileOffsets.has(threadKey)) {
+        if (shouldPollSessionFile && !this.sessionFileOffsets.has(threadKey)) {
           await this.#initializeSessionFileOffset(threadKey, sessionPath, 'end');
         }
+        const topicId = await this.#ensureTopicForThread(threadId, thread);
         if (topicId && !this.subscribedThreads.has(threadKey)) {
           if (this.#queueResumeThreadForSubscription(threadId)) {
             stats.resumed += 1;
@@ -853,7 +853,7 @@ export class CodexTelegramTopicBridge {
   async #pollSessionFiles() {
     if (this.#shouldMirrorNoMessages()) return;
     for (const [threadId, sessionPath] of this.sessionFilePaths.entries()) {
-      if (!this.state.getTopicForThread(threadId)) continue;
+      if (!this.state.getTopicForThread(threadId) && !this.topicCreationFailures.has(threadId)) continue;
       try {
         await this.#pollSessionFile(threadId, sessionPath);
       } catch (error) {
@@ -872,6 +872,10 @@ export class CodexTelegramTopicBridge {
     if (info.size <= currentOffset) {
       if (info.size < currentOffset) this.sessionFileOffsets.set(threadId, info.size);
       return;
+    }
+    // Reuse delivery recovery before consuming unread records after failed creation.
+    if (!this.state.getTopicForThread(threadId)) {
+      await this.#withTopicRecovery(threadId, async () => {});
     }
     const mirrorTranscript = !this.state.data.paused?.mirroring;
     const raw = await readFile(sessionPath);
@@ -1004,7 +1008,7 @@ export class CodexTelegramTopicBridge {
     try {
       await this.telegram.sendMessage({
         chatId: this.state.boundChatId,
-        text: `Could not create Telegram topic for Codex thread "${title}": ${error.message}. Make the bot an admin with permission to create/manage topics, then run /bind again.`,
+        text: `Could not create Telegram topic for Codex thread "${title}": ${error.message}. ${Number(error?.response?.error_code) === 403 ? 'Check that the bot is an admin with permission to create/manage topics.' : 'Topic creation will be retried on new conversation activity.'}`,
       });
     } catch (notifyError) {
       this.logger.error(notifyError);
@@ -1107,7 +1111,7 @@ export class CodexTelegramTopicBridge {
   async #withTopicRecovery(threadId, operation) {
     const pendingRecovery = this.pendingTopicRecoveries.get(String(threadId));
     if (pendingRecovery) await pendingRecovery;
-    const topicId = this.state.getTopicForThread(threadId);
+    const topicId = this.state.getTopicForThread(threadId) ?? await this.#ensureTopicForThread(threadId);
     if (!topicId) throw new Error('No Telegram topic is mapped for this conversation.');
     try {
       await operation(topicId);
@@ -1156,7 +1160,7 @@ export class CodexTelegramTopicBridge {
     const pendingRecovery = this.pendingTopicRecoveries.get(String(threadId));
     if (pendingRecovery) await pendingRecovery;
     let messageThreadId = this.state.getTopicForThread(threadId);
-    if (!this.state.boundChatId || !messageThreadId) return;
+    if (!this.state.boundChatId) return;
     if (!this.alertChatId || copyToTopic) {
       messageThreadId = await this.#withTopicRecovery(threadId, topicId => this.telegram.sendMessage({
         chatId: this.state.boundChatId, messageThreadId: topicId, text, replyMarkup,
@@ -1183,8 +1187,7 @@ export class CodexTelegramTopicBridge {
   async #sendCompletionNotice(threadId, reason, detail = null, turnId = null) {
     const pendingRecovery = this.pendingTopicRecoveries.get(String(threadId));
     if (pendingRecovery) await pendingRecovery;
-    const messageThreadId = this.state.getTopicForThread(threadId);
-    if (!this.state.boundChatId || !messageThreadId) return;
+    if (!this.state.boundChatId) return;
     // Both app-server events and the session tail can report the same turn.
     const now = Date.now();
     const recent = (this.completionNotices.get(String(threadId)) ?? [])
@@ -1672,6 +1675,9 @@ function renderResponseItem(payload, messageScope = 'all') {
     return { text: withMessageType(payload.type, ['Tool output', truncateText(payload.output)].filter(Boolean).join('\n')) };
   }
   if (payload.type !== 'message') return { text: null };
+  // agent_message is the canonical assistant reply; raw response items may
+  // repeat it with internal memory-citation metadata attached.
+  if (payload.role === 'assistant') return { text: null };
   const role = payload.role === 'user' ? 'User' : payload.role === 'assistant' ? 'Codex' : null;
   if (!role) return { text: null, debugReason: `response_item message had unsupported role: ${payload.role ?? 'missing'}` };
   const text = extractResponseItemText(payload.content);

@@ -1432,6 +1432,9 @@ function renderResponseItem(payload, messageScope = 'all') {
     return { text: withMessageType(payload.type, ['Tool output', truncateText(payload.output)].filter(Boolean).join('\n')) };
   }
   if (payload.type !== 'message') return { text: null };
+  // agent_message is the canonical assistant reply; raw response items may
+  // repeat it with internal memory-citation metadata attached.
+  if (payload.role === 'assistant') return { text: null };
   const role = payload.role === 'user' ? 'User' : payload.role === 'assistant' ? 'Codex' : null;
   if (!role) return { text: null, debugReason: `response_item message had unsupported role: ${payload.role ?? 'missing'}` };
   const text = extractResponseItemText(payload.content);

@@ -144,7 +144,7 @@ test('mapped session files are tailed even when app-server reports vscode source
   assert.deepEqual(telegram.sent.map((message) => message.text), ['agent_message\nCodex\nfrom assistant']);
 });
 
-test('session file tailing mirrors response_item message records', async () => {
+test('session file tailing ignores assistant response items and preserves user records', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-toolbox-response-item-'));
   const file = join(dir, 'session.jsonl');
   await writeFile(file, '', 'utf8');
@@ -156,11 +156,11 @@ test('session file tailing mirrors response_item message records', async () => {
   const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
 
   await bridge.start();
-  await appendFile(file, `${responseMessageLine('assistant', 'from response item')}\n`, 'utf8');
+  await appendFile(file, `${responseMessageLine('assistant', 'from response item')}\n${responseMessageLine('user', 'from user response item')}\n`, 'utf8');
   await bridge.discoverThreads();
   await bridge.stop();
 
-  assert.deepEqual(telegram.sent.map((message) => message.text), ['response_item/message\nCodex\nfrom response item']);
+  assert.deepEqual(telegram.sent.map((message) => message.text), ['response_item/message\nUser\nfrom user response item']);
 });
 
 test('session file tailing mirrors response_item tool records', async () => {
@@ -244,12 +244,12 @@ test('session file tailing sends debug notices for message records without text'
   const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
 
   await bridge.start();
-  await appendFile(file, `${responseMessageLine('assistant', '')}\n`, 'utf8');
+  await appendFile(file, `${responseMessageLine('user', '')}\n`, 'utf8');
   await bridge.discoverThreads();
   await bridge.stop();
 
   assert.match(telegram.sent.at(-1).text, /Debug: Codex message not sent to Telegram/);
-  assert.match(telegram.sent.at(-1).text, /response_item assistant message had no text content/);
+  assert.match(telegram.sent.at(-1).text, /response_item user message had no text content/);
 });
 
 test('session file tailing sends task completion notices at high priority', async () => {
@@ -1503,7 +1503,7 @@ test('disabled user mirroring filters live and session users but preserves agent
     codex.emit('event', {method:'item/completed',threadId:'t1',raw:{params:{item:{id:'u1',type:'userMessage',content:[{type:'text',text:'live user'}]}}}});
     codex.emit('event', {method:'message/completed',threadId:'t1',raw:{params:{role:'user',text:'alternate user'}}});
     await tick();
-    await appendFile(file, [sessionLine('user_message',{message:'log user'}),responseMessageLine('user','response user'),responseMessageLine('assistant','Agent answer'),sessionLine('task_complete',{turn_id:'done1'})].join('\n')+'\n');
+    await appendFile(file, [sessionLine('user_message',{message:'log user'}),responseMessageLine('user','response user'),sessionLine('agent_message', {message:'Agent answer'}),sessionLine('task_complete',{turn_id:'done1'})].join('\n')+'\n');
     await bridge.discoverThreads();
     assert.equal(telegram.sent.length,2);
     assert.match(telegram.sent[0].text,/Agent answer/);
@@ -1537,6 +1537,7 @@ test('private alerts label current conversation and leave transcript and respons
   await bridge.start();
   try {
     await appendFile(file, sessionLine('agent_message', {message:'Final result'})+'\n');
+    await appendFile(file, responseMessageLine('assistant', 'Final result\n<oai-mem-citation><citation_entries>memory reference</citation_entries></oai-mem-citation>')+'\n');
     await bridge.discoverThreads();
     await state.mapThread('t1', 44, 'Renamed *agent*');
     codex.emit('event', {method:'turn/completed',threadId:'t1',turnId:'turn1',raw:{params:{}}});
@@ -1547,6 +1548,8 @@ test('private alerts label current conversation and leave transcript and respons
     await bridge.discoverThreads();
     assert.equal(telegram.sent.filter(m => m.notify).length, 1);
     assert.ok(telegram.sent.some(m => m.chatId === '-10012345' && m.text.includes('Final result') && !m.notify));
+    assert.equal(telegram.sent.filter(m => m.text.includes('Final result')).length, 1);
+    assert.ok(telegram.sent.every(m => !m.text.includes('<oai-mem-citation>')));
     const completion = telegram.sent.find(m => m.notify);
     assert.equal(completion.chatId, '111111111');
     assert.equal(completion.messageThreadId, undefined);
@@ -1666,6 +1669,48 @@ test('a failed shared creation can be retried on later activity', async (t) => {
   assert.equal(state.getTopicForThread('parent'), 1001);
 });
 
+test('session delivery recovers a missing topic after fork timeout using the latest name', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-fork-timeout-'));
+  const file = join(dir, 'session.jsonl');
+  await writeFile(file, sessionLine('agent_message', { message: 'Old fork history' })+'\n');
+  const state = memoryState();
+  await state.bindChat(-10012345);
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const threads = [];
+  codex.listThreads = async () => threads;
+  const create = telegram.createForumTopic;
+  let attempts = 0;
+  telegram.createForumTopic = async (...args) => {
+    if (++attempts <= 2) throw new Error('Telegram createForumTopic request timed out');
+    return create(...args);
+  };
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, alertChatId: '111', messageScope: 'conversation', logger: { error() {} } });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  threads.push({ id: 'fork', source: 'cli', name: 'Before rename', path: file, createdAt: Date.now()+1000, updatedAt: '1' });
+  await bridge.discoverThreads();
+  assert.equal(attempts, 1);
+  assert.equal(state.getTopicForThread('fork'), null);
+  assert.ok(telegram.sent.every(m => !m.text.includes('Make the bot an admin')));
+  threads[0].name = 'After rename';
+  await appendFile(file, [sessionLine('agent_message', { message: 'New fork answer' }), sessionLine('task_complete', { turn_id: 'fork-turn' })].join('\n')+'\n');
+  await bridge.discoverThreads();
+  assert.equal(attempts, 2);
+  await bridge.discoverThreads();
+  assert.equal(attempts, 3);
+  assert.equal(state.getThread('fork').title, 'After rename');
+  assert.equal(telegram.sent.filter(m => m.text.includes('New fork answer')).length, 1);
+  assert.ok(telegram.sent.every(m => !m.text.includes('Old fork history')));
+  const alerts = telegram.sent.filter(m => m.chatId === '111');
+  assert.equal(alerts.length, 1);
+  assert.ok(alerts[0].notify);
+  assert.ok(alerts[0].text.includes('https://t.me/c/12345/1001'));
+  await bridge.discoverThreads();
+  assert.equal(attempts, 3);
+  assert.equal(telegram.sent.filter(m => m.text.includes('New fork answer')).length, 1);
+});
+
 test('missing source metadata prevents automatic topic creation', async (t) => {
   const state = memoryState();
   await state.bindChat(-100);
@@ -1731,14 +1776,14 @@ test('pause retains alerts and resume skips unread transcript history from the p
   assert.ok(!telegram.sent.some(m => m.text.includes('Hidden while paused')));
   assert.ok(telegram.sent.some(m => m.chatId === '111' && m.text.includes('task complete')));
   assert.ok(telegram.sent.some(m => m.text.includes('Still need your input?')));
-  const oldLine = JSON.parse(responseMessageLine('assistant','Unread paused history'));
+  const oldLine = JSON.parse(sessionLine('agent_message', {message:'Unread paused history'}));
   oldLine.timestamp = '2000-01-01T00:00:00.000Z';
   await appendFile(file,JSON.stringify(oldLine)+'\n');
   command('/resume');
   await tick();
   await bridge.discoverThreads();
   assert.ok(!telegram.sent.some(m => m.text.includes('Unread paused history')));
-  await appendFile(file,responseMessageLine('assistant','New desktop progress')+'\n');
+  await appendFile(file,sessionLine('agent_message', {message:'New desktop progress'})+'\n');
   await bridge.discoverThreads();
   assert.ok(telegram.sent.some(m => m.text.includes('New desktop progress')));
 });
@@ -1915,7 +1960,7 @@ test('streaming includes both desktop and Telegram turns and preserves attention
 test('discovery skips history and session tail forwards both desktop and Telegram turns', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-afk-'));
   const file = join(dir, 'session.jsonl');
-  await writeFile(file, responseMessageLine('assistant', 'Old history')+'\n'+sessionLine('task_complete',{turn_id:'old'})+'\n');
+  await writeFile(file, sessionLine('agent_message', {message:'Old history'})+'\n'+sessionLine('task_complete',{turn_id:'old'})+'\n');
   const state = memoryState();
   await state.bindChat(-100);
   const telegram = fakeTelegram();
@@ -1929,8 +1974,8 @@ test('discovery skips history and session tail forwards both desktop and Telegra
   codex.sendToThread = async () => ({turn:{id:'remote'}});
   telegram.emit('update', {message:allowedMessage({text:'Continue',chat:{id:-100,type:'supergroup'},is_topic_message:true,message_thread_id:1001})});
   await tick();
-  await appendFile(file, [sessionLine('task_started',{turn_id:'desktop'}),responseMessageLine('assistant','Desktop log'),
-    sessionLine('task_started',{turn_id:'remote'}),responseMessageLine('assistant','Remote log'),sessionLine('task_complete',{turn_id:'remote'})].join('\n')+'\n');
+  await appendFile(file, [sessionLine('task_started',{turn_id:'desktop'}),sessionLine('agent_message', {message:'Desktop log'}),
+    sessionLine('task_started',{turn_id:'remote'}),sessionLine('agent_message', {message:'Remote log'}),sessionLine('task_complete',{turn_id:'remote'})].join('\n')+'\n');
   await bridge.discoverThreads();
   assert.ok(telegram.sent.some(m => m.text.includes('Desktop log')));
   assert.ok(telegram.sent.some(m => m.text.includes('Remote log')));
