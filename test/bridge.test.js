@@ -642,6 +642,60 @@ test('topic replies in unmapped topics are silently ignored', async () => {
   assert.deepEqual(telegram.sent, []);
 });
 
+test('only the owning bridge processes new commands delivered to multiple bots', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'codex-topic-owner-'));
+  for (const command of ['/new', '/new@arjun_codex_notifier_win_bot']) {
+    await t.test(command, async (t) => {
+      const clients = [];
+      for (const topic of [44, 45]) {
+        const state = memoryState();
+        await state.bindChat(-100);
+        await state.mapThread('existing', topic, 'Existing');
+        const telegram = fakeTelegram();
+        const codex = fakeCodex();
+        codex.readThread = async () => ({ id: 'existing', cwd });
+        const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
+        await bridge.start();
+        t.after(() => bridge.stop());
+        clients.push({ telegram, codex });
+      }
+      for (const { telegram } of clients) {
+        telegram.emit('update', { message: allowedMessage({ text: `${command} New chat`, chat: { id: -100, type: 'supergroup' }, is_topic_message: true, message_thread_id: 44 }) });
+      }
+      await delay(50);
+      assert.deepEqual(clients[0].codex.created, [{ title: 'New chat', options: { cwd } }]);
+      assert.equal(clients[0].telegram.created.length, 1);
+      assert.deepEqual(clients[1].codex.created, []);
+      assert.deepEqual(clients[1].telegram.created, []);
+      assert.deepEqual(clients[1].telegram.sent, []);
+    });
+  }
+});
+
+test('commands in unowned topics are silent, including unauthorized users and other groups', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('existing', 44, 'Existing');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  for (const [chatId, topic] of [[-100, 99], [-200, 44]]) {
+    for (const userId of [111111111, 123]) {
+      for (const command of ['/help', '/status', '/pause', '/rename Wrong', '/interrupt', '/new@other_bot']) {
+        telegram.emit('update', { message: { from: { id: userId }, text: command, chat: { id: chatId, type: 'supergroup' }, message_thread_id: topic, is_topic_message: true } });
+      }
+    }
+  }
+  await tick();
+  assert.deepEqual(telegram.sent, []);
+  assert.deepEqual(codex.created, []);
+  assert.deepEqual(codex.interrupted, []);
+  assert.deepEqual(codex.renamed, []);
+  assert.equal(state.data.paused.mirroring, false);
+});
+
 test('allowed messages outside forum topics get guidance', async () => {
   const state = memoryState();
   await state.bindChat(-100);

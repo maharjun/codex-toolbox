@@ -178,11 +178,15 @@ export class CodexTelegramTopicBridge {
 
     const message = update.message;
     if (!message?.text) return;
+    const command = getCommand(message);
+    // Reuse topic ownership for commands, just as we do for conversation replies.
+    // Binding and relinking must work before a topic belongs to this bridge.
+    if (command && message.message_thread_id && command !== '/bind' && command !== '/relink'
+      && !this.#threadIdForMessage(message)) return;
     if (!this.#isAllowedUser(message.from)) {
       await this.#sendUnauthorizedUserNotice(message);
       return;
     }
-    const command = getCommand(message);
     if (command === '/bind') {
       await this.#bind(message);
       return;

@@ -203,6 +203,8 @@ pm2 save
 
 ## Telegram Commands
 
+Commands inside a linked topic are handled only by its owning bridge, whether or not you add `@botname`. The suffix does not select a different bridge. `/bind` and `/relink` are exceptions because they establish ownership; commands outside topics retain their existing behavior.
+
 - `/bind`: bind the current forum group.
 - `/help`: list available commands.
 - `/new Optional title`: inside a linked topic, create a new Codex thread and Telegram topic in the current conversation’s directory. Outside a linked topic, choose a project and worktree.
