@@ -31,7 +31,7 @@ Configuration: ~/.config/codex-toolbox/config.json
 State: ~/.local/state/codex-toolbox/state.json
 Both contain pairing/session identifiers and are private to your account.
 
-Telegram: /topics lists mapped conversations. /rename inside a topic changes the Codex name. Ordinary topic messages go to that conversation. /new --cwd /absolute/path Title creates a conversation explicitly in that directory. The upstream project picker defaults to the author's directory layout; prefer explicit --cwd.
+Telegram: /topics lists mapped conversations. /rename inside a topic changes the Codex name. Ordinary topic messages go to that conversation. /new --cwd /absolute/path Title creates a conversation explicitly in that directory. Inside a linked topic, /new inherits that conversation’s directory. Outside a linked topic, the project picker uses CODEX_PROJECTS_ROOT or the upstream default directory layout.
 
 Validation: 88 focused Telegram, bridge, transport-client, configuration, and state tests passed. The full upstream suite has existing Discord failures. The local daemon initialization and metadata listing were verified without printing conversation content.
 

@@ -951,11 +951,19 @@ test('topic creation rate limits pause repeated topic creation attempts', async 
   assert.equal(state.getTopicForThread('old'), null);
 });
 
-test('/new without --cwd opens the project selector', async () => {
+test('/new without --cwd opens the project selector', { timeout: 5000 }, async () => {
   const { root, restore } = await useTemporaryProjectsRoot();
   const state = memoryState();
   await state.bindChat(-100);
   const telegram = fakeTelegram();
+  const sendMessage = telegram.sendMessage;
+  let receivedReply;
+  const reply = new Promise(resolve => { receivedReply = resolve; });
+  telegram.sendMessage = async message => {
+    const result = await sendMessage(message);
+    receivedReply();
+    return result;
+  };
   const codex = fakeCodex();
   const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
 
@@ -963,7 +971,7 @@ test('/new without --cwd opens the project selector', async () => {
     await createSelectableProject(root, 'toolbox');
     await bridge.start();
     telegram.emit('update', { message: allowedMessage({ text: '/new Investigate bug', chat: { id: -100, type: 'supergroup' } }) });
-    await delay(100);
+    await reply;
   } finally {
     await bridge.stop();
     restore();
@@ -973,6 +981,47 @@ test('/new without --cwd opens the project selector', async () => {
   assert.match(telegram.sent.at(-1).text, /Select a project/);
   assert.ok(telegram.sent.at(-1).replyMarkup);
   assert.equal(telegram.sent.at(-1).replyMarkup.inline_keyboard.at(-1)[0].text, 'Help');
+});
+
+test('/new in a linked topic uses its conversation cwd unless explicitly overridden', async (t) => {
+  const inherited = await mkdtemp(join(tmpdir(), 'codex-inherited-cwd-'));
+  const override = await mkdtemp(join(tmpdir(), 'codex-override-cwd-'));
+  for (const explicit of [false, true]) {
+    await t.test(explicit ? 'explicit cwd wins' : 'inherits cwd with bot-qualified command', async (t) => {
+      const state = memoryState();
+      await state.bindChat(-100);
+      await state.mapThread('existing', 44, 'Existing');
+      const telegram = fakeTelegram();
+      const codex = fakeCodex();
+      const reads = [];
+      codex.readThread = async id => { reads.push(id); return { id, cwd: inherited }; };
+      const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
+      await bridge.start();
+      t.after(() => bridge.stop());
+      const args = explicit ? ` --cwd "${override}"` : '';
+      telegram.emit('update', { message: allowedMessage({ text: `/new@arjun_codex_notifier_win_bot${args} New chat`, chat: { id: -100, type: 'supergroup' }, message_thread_id: 44, is_topic_message: true }) });
+      await delay(50);
+      assert.deepEqual(reads, explicit ? [] : ['existing']);
+      assert.deepEqual(codex.created, [{ title: 'New chat', options: { cwd: explicit ? override : inherited } }]);
+      assert.equal(state.getTopicForThread('existing'), 44);
+      assert.equal(state.getTopicForThread('new-thread'), 1001);
+    });
+  }
+});
+
+test('/new in a linked topic reports missing cwd instead of using another directory', async (t) => {
+  const state = memoryState();
+  await state.bindChat(-100);
+  await state.mapThread('existing', 44, 'Existing');
+  const telegram = fakeTelegram();
+  const codex = fakeCodex();
+  const bridge = new CodexTelegramTopicBridge({ codex, telegram, state, allowedUserIds: [111111111] });
+  await bridge.start();
+  t.after(() => bridge.stop());
+  telegram.emit('update', { message: allowedMessage({ text: '/new', chat: { id: -100, type: 'supergroup' }, message_thread_id: 44, is_topic_message: true }) });
+  await delay(50);
+  assert.deepEqual(codex.created, []);
+  assert.match(telegram.sent.at(-1).text, /Could not determine this conversation.*directory/);
 });
 
 test('/new accepts --cwd to start a Codex thread in a directory', async () => {

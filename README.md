@@ -205,7 +205,7 @@ pm2 save
 
 - `/bind`: bind the current forum group.
 - `/help`: list available commands.
-- `/new Optional title`: choose a project and worktree, then create a Codex thread and Telegram topic.
+- `/new Optional title`: inside a linked topic, create a new Codex thread and Telegram topic in the current conversation’s directory. Outside a linked topic, choose a project and worktree.
 - `/new --cwd /absolute/path Optional title`: create a Codex thread in a specific directory. `--dir` is also accepted. Paths must be absolute; `~/path` is supported.
 - `/topics`: list current `threadId -> message_thread_id -> title` mappings.
 - `/delete_all_topics confirm`: delete all Codex-mapped Telegram topics, clear mappings and approvals, and keep the group binding.

@@ -274,6 +274,17 @@ export class CodexTelegramTopicBridge {
       return;
     }
     if (!parsed.cwd) {
+      const threadId = this.#threadIdForMessage(message);
+      if (threadId) {
+        const thread = await this.codex.readThread(threadId);
+        if (!thread?.cwd) {
+          await this.telegram.sendMessage({ chatId: message.chat.id, messageThreadId: message.message_thread_id, text: 'Could not determine this conversation’s directory. Use /new --cwd with an absolute directory path.' });
+          return;
+        }
+        parsed.cwd = thread.cwd;
+      }
+    }
+    if (!parsed.cwd) {
       await this.#showProjectPicker(message, parsed.title);
       return;
     }
@@ -1576,7 +1587,7 @@ function helpText() {
   return [
     'Codex Toolbox commands',
     '/bind - bind this forum group',
-    '/new Optional title - choose a project and worktree for a new Codex topic',
+    '/new Optional title - create a conversation in this topic’s directory, or choose a project outside a linked topic',
     '/new --cwd /path Optional title - create a Codex thread from an exact directory',
     '/topics - list mapped Codex topics',
     '/delete_all_topics confirm - delete all Codex-mapped topics',
